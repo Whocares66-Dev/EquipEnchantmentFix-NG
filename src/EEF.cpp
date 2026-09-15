@@ -142,7 +142,10 @@ namespace EEF
 			}
 
 			auto* actor = a_ref->As<RE::Actor>();
-			if (!actor) {
+			// Gate here, while the pointer is guaranteed live (it comes straight
+			// from the event): never queue a check for an actor that is already
+			// deleted or dead.
+			if (!IsValidActor(actor)) {
 				return;
 			}
 
@@ -156,6 +159,8 @@ namespace EEF
 				return;
 			}
 
+			const auto formID = actor->GetFormID();
+
 			{
 				std::scoped_lock lock(s_queueLock);
 				if (!s_pending.emplace(handle).second) {
@@ -163,17 +168,24 @@ namespace EEF
 				}
 			}
 
-			taskInterface->AddTask([handle]() {
+			taskInterface->AddTask([handle, formID]() {
 				{
 					std::scoped_lock lock(s_queueLock);
 					s_pending.erase(handle);
 				}
 
-				auto ref = handle.get();
+				// Re-validate through the live form table: if the actor was deleted
+				// or unloaded after the check was queued, its entry is gone and we
+				// must not touch the stale pointer at all -- not even for an
+				// IsDeleted()/IsDead() probe, which is itself a virtual call.
+				// FormIDs are never reused within a session, so a hit here is the
+				// same object, and there is no yield between this lookup and its
+				// use below.
+				auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(formID);
 				if (!ref) {
 					return;
 				}
-				if (auto* loaded = ref->As<RE::Actor>()) {
+				if (auto* loaded = ref->As<RE::Actor>(); IsValidActor(loaded)) {
 					ProcessActor(loaded);
 				}
 			});
