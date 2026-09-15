@@ -20,8 +20,11 @@ namespace EEF
 			RE::BSTEventSource<RE::TESEquipEvent>* a_eventSource) override;
 	};
 
-	// On actor load / script init, the engine can restore a save without replaying
-	// the enchantment abilities onto worn items. Verify them a frame later.
+	// Actors that stream in after a load still need a check. Both event
+	// sources feed the same batched queue: TESObjectLoadedEvent covers every
+	// streaming reference (including scriptless NPCs), TESInitScriptEvent
+	// covers scripted ones. Neither queues a task per event -- see
+	// ScheduleActorCheck -- so the load-time burst stays cheap.
 	class LoadEventHandler final :
 		public RE::BSTEventSink<RE::TESObjectLoadedEvent>,
 		public RE::BSTEventSink<RE::TESInitScriptEvent>

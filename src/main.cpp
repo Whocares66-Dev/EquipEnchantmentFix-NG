@@ -30,6 +30,11 @@ namespace
 			EEF::ClearPendingChecks();
 			break;
 		case SKSE::MessagingInterface::kPostLoadGame:
+			// Only the weight recompute here. The actor re-check runs from the
+			// event path alone (TESObjectLoadedEvent / TESInitScriptEvent): an
+			// extra sweep from this message would process the same actors a
+			// second time in the same frame, and UpdateArmorAbility does not
+			// de-duplicate, so effects would be applied twice.
 			EEF::RecalcPlayerWeight();
 			break;
 		default:
