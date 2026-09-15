@@ -28,6 +28,33 @@ namespace EEF
 			RE::BSCRC32<RE::ObjectRefHandle>>
 			s_pending;
 
+		// Form-table lookups are not safe from every context -- the engine posts
+		// the equip event while its own form-table lock is in play, and
+		// TESForm::LookupByID on a lookup path whose Address Library entry is
+		// missing faults inside a forwarded call. Every lookup we cannot
+		// remove goes through here, so a bad table turns into a missing form
+		// instead of a crash.
+		[[nodiscard]] RE::TESForm* LookupFormSafe(RE::FormID a_id)
+		{
+			if (!a_id) {
+				return nullptr;
+			}
+
+			__try {
+				return RE::TESForm::LookupByID(a_id);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				SKSE::log::error("TESForm::LookupByID({:08X}) raised; treating as missing", a_id);
+				return nullptr;
+			}
+		}
+
+		template <class T>
+		[[nodiscard]] T* LookupFormSafe(RE::FormID a_id)
+		{
+			auto* form = LookupFormSafe(a_id);
+			return form ? form->As<T>() : nullptr;
+		}
+
 		[[nodiscard]] bool IsValidActor(RE::Actor* a_actor)
 		{
 			// IsDeleted() / IsInitialized() read formFlags straight off the
@@ -67,18 +94,47 @@ namespace EEF
 			return a_enchantment->data.castingType == RE::MagicSystem::CastingType::kConstantEffect;
 		}
 
-		[[nodiscard]] bool HasItemAbility(RE::Actor* a_actor, RE::TESForm* a_form, RE::EnchantmentItem* a_enchantment)
+		// MSVC forbids __try in a function that needs stack unwinding, so each
+		// fault-prone engine call gets its own small, object-free helper.
+		[[nodiscard]] bool TryHasMagicEffect(RE::Actor* a_actor, RE::EffectSetting* a_effect)
 		{
-			auto* effects = a_actor->GetActiveEffectList();
-			if (!effects) {
+			__try {
+				return a_actor->HasMagicEffect(a_effect);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		[[nodiscard]] bool TryUpdateArmorAbility(RE::Actor* a_actor, RE::TESForm* a_form, RE::ExtraDataList* a_extraData)
+		{
+			__try {
+				a_actor->UpdateArmorAbility(a_form, a_extraData);
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		[[nodiscard]] bool HasItemAbility(RE::Actor* a_actor, [[maybe_unused]] RE::TESForm* a_form, RE::EnchantmentItem* a_enchantment)
+		{
+			if (!a_actor || !a_enchantment) {
 				return false;
 			}
 
-			for (auto& effect : *effects) {
-				if (!effect) {
-					continue;
-				}
-				if (effect->source == a_form && effect->spell == a_enchantment) {
+			// We cannot walk the actor's active effects here: both
+			// MagicTarget::GetActiveEffectList (a RelocateVirtual vtable-slot
+			// forwarder) and MagicTarget::VisitEffects fault on this setup.
+			// MagicTarget::HasMagicEffect does not -- it is a plain
+			// Address-Library call, and it is the same engine entry the Papyrus
+			// Actor.HasMagicEffect native function uses.
+			//
+			// It matches on the magic effect instead of the (source, spell)
+			// pair, so it is a coarser test: an effect granted by some other
+			// source would read as "already present". For the enchantment
+			// abilities we re-apply that is the safe direction -- worst case we
+			// skip a re-apply rather than duplicate one.
+			for (auto* effect : a_enchantment->effects) {
+				if (effect && effect->baseEffect && TryHasMagicEffect(a_actor, effect->baseEffect)) {
 					return true;
 				}
 			}
@@ -156,7 +212,9 @@ namespace EEF
 					c.form->GetFormID(),
 					a_actor->GetFormID());
 
-				a_actor->UpdateArmorAbility(c.form, c.worn);
+				if (!TryUpdateArmorAbility(a_actor, c.form, c.worn)) {
+					SKSE::log::error("UpdateArmorAbility faulted; skipped");
+				}
 			}
 		}
 
@@ -202,17 +260,14 @@ namespace EEF
 					s_pending.erase(handle);
 				}
 
-				// Re-validate through the live form table: if the actor was deleted
-				// or unloaded after the check was queued, its entry is gone and we
-				// must not touch the stale pointer at all -- not even for an
-				// IsDeleted()/IsDead() probe, which is itself a virtual call.
-				// FormIDs are never reused within a session, so a hit here is the
-				// same object, and there is no yield between this lookup and its
-				// use below.
-				auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(formID);
+				// Re-validate through the live form table: if the actor was
+				// deleted or unloaded after the check was queued, its entry is
+				// gone and we must not touch the stale pointer at all.
+				auto* ref = LookupFormSafe<RE::TESObjectREFR>(formID);
 				if (!ref) {
 					return;
 				}
+
 				if (auto* loaded = ref->As<RE::Actor>(); IsValidActor(loaded)) {
 					ProcessActor(loaded);
 				}
@@ -275,11 +330,13 @@ namespace EEF
 		const RE::TESEquipEvent*               a_event,
 		RE::BSTEventSource<RE::TESEquipEvent>*)
 	{
+		// No form-table lookup here on purpose: this event fires while the
+		// engine's form-table lock is in play, and looking the base object up
+		// from here crashes. ProcessActor already walks the worn list and only
+		// touches armour, so the lookup bought us nothing but a crash.
 		if (s_onEquip && a_event && a_event->equipped && a_event->actor) {
 			if (auto* actor = a_event->actor->As<RE::Actor>(); IsValidActor(actor)) {
-				if (const auto* form = RE::TESForm::LookupByID(a_event->baseObject); form && form->As<RE::TESObjectARMO>()) {
-					ProcessActor(actor);
-				}
+				ProcessActor(actor);
 			}
 		}
 
@@ -291,7 +348,7 @@ namespace EEF
 		RE::BSTEventSource<RE::TESObjectLoadedEvent>*)
 	{
 		if (a_event && a_event->loaded) {
-			if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(a_event->formID)) {
+			if (auto* ref = LookupFormSafe<RE::TESObjectREFR>(a_event->formID)) {
 				ScheduleActorCheck(ref);
 			}
 		}
