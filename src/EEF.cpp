@@ -28,12 +28,15 @@ namespace EEF
 			RE::BSCRC32<RE::ObjectRefHandle>>
 			s_pending;
 
-		// Form-table lookups are not safe from every context -- the engine posts
-		// the equip event while its own form-table lock is in play, and
-		// TESForm::LookupByID on a lookup path whose Address Library entry is
-		// missing faults inside a forwarded call. Every lookup we cannot
-		// remove goes through here, so a bad table turns into a missing form
-		// instead of a crash.
+		// True while a drain task is already queued, so a burst of events only
+		// ever queues one.
+		bool s_drainQueued{ false };
+
+		// Form-table lookups are not safe from every context, so every lookup
+		// we cannot remove goes through here: a bad table turns into a missing
+		// form instead of a crash. The per-event cost is microseconds (x64 SEH
+		// is table-driven and free when nothing raises), which is what makes
+		// handling thousands of load-time events affordable.
 		[[nodiscard]] RE::TESForm* LookupFormSafe(RE::FormID a_id)
 		{
 			if (!a_id) {
@@ -218,9 +221,11 @@ namespace EEF
 			}
 		}
 
-		// Defer the check to the task queue: during the load / equip / effect event
-		// the actor state is not settled yet. Mirrors the original plugin's
-		// EnchantmentEnforcerTask, including its per-actor de-duplication.
+		// Queue an actor for a re-check. The handle only goes into a set here --
+		// no form-table lookup, no per-actor task -- and exactly ONE drain task
+		// is queued for the whole batch. On a save load the engine fires these
+		// events for thousands of references, and one queued task each is what
+		// froze the main thread for seconds.
 		void ScheduleActorCheck(RE::TESObjectREFR* a_ref)
 		{
 			if (!a_ref) {
@@ -235,41 +240,49 @@ namespace EEF
 				return;
 			}
 
-			auto* taskInterface = SKSE::GetTaskInterface();
-			if (!taskInterface) {
-				return;
-			}
-
 			RE::ObjectRefHandle handle(actor);
 			if (!handle) {
 				return;
 			}
 
-			const auto formID = actor->GetFormID();
-
 			{
 				std::scoped_lock lock(s_queueLock);
-				if (!s_pending.emplace(handle).second) {
+				s_pending.insert(handle);
+				if (s_drainQueued) {
 					return;
 				}
+				s_drainQueued = true;
 			}
 
-			taskInterface->AddTask([handle, formID]() {
+			auto* taskInterface = SKSE::GetTaskInterface();
+			if (!taskInterface) {
+				std::scoped_lock lock(s_queueLock);
+				s_drainQueued = false;
+				return;
+			}
+
+			taskInterface->AddTask([]() {
+				std::unordered_set<
+					RE::ObjectRefHandle,
+				RE::BSCRC32<RE::ObjectRefHandle>>
+					batch;
+
 				{
 					std::scoped_lock lock(s_queueLock);
-					s_pending.erase(handle);
+					batch.swap(s_pending);
+					s_drainQueued = false;
 				}
 
-				// Re-validate through the live form table: if the actor was
-				// deleted or unloaded after the check was queued, its entry is
-				// gone and we must not touch the stale pointer at all.
-				auto* ref = LookupFormSafe<RE::TESObjectREFR>(formID);
-				if (!ref) {
-					return;
-				}
-
-				if (auto* loaded = ref->As<RE::Actor>(); IsValidActor(loaded)) {
-					ProcessActor(loaded);
+				// The handle resolves to a live reference-counted pointer, so a
+				// stale actor simply resolves to nothing here.
+				for (const auto& handle : batch) {
+					auto ref = handle.get();
+					if (!ref) {
+						continue;
+					}
+					if (auto* loaded = ref->As<RE::Actor>(); IsValidActor(loaded)) {
+						ProcessActor(loaded);
+					}
 				}
 			});
 		}
@@ -302,6 +315,26 @@ namespace EEF
 	{
 		std::scoped_lock lock(s_queueLock);
 		s_pending.clear();
+		s_drainQueued = false;
+	}
+
+	// Called once the save has finished loading. Walks the game's own actor
+	// lists rather than the loaded-reference event stream: those lists contain
+	// only actors (tens to hundreds) and hand out live pointers directly, so
+	// there is nothing to look up and nothing to queue per reference.
+	void CheckLoadedActors()
+	{
+		auto* lists = RE::ProcessLists::GetSingleton();
+		if (!lists) {
+			return;
+		}
+
+		lists->ForAllActors([](RE::Actor* a_actor) -> RE::BSContainer::ForEachResult {
+			if (IsValidActor(a_actor)) {
+				ProcessActor(a_actor);
+			}
+			return RE::BSContainer::ForEachResult::kContinue;
+		});
 	}
 
 	void RecalcPlayerWeight()
@@ -347,6 +380,9 @@ namespace EEF
 		const RE::TESObjectLoadedEvent*               a_event,
 		RE::BSTEventSource<RE::TESObjectLoadedEvent>*)
 	{
+		// Deliberately cheap: resolve-and-queue only, no work here. The
+		// single shared drain task (see ScheduleActorCheck) is what bounds
+		// the load-time burst -- one task no matter how many references load.
 		if (a_event && a_event->loaded) {
 			if (auto* ref = LookupFormSafe<RE::TESObjectREFR>(a_event->formID)) {
 				ScheduleActorCheck(ref);
