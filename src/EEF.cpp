@@ -2,7 +2,9 @@
 
 #include <SimpleIni.h>
 
+#include <chrono>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -31,6 +33,51 @@ namespace EEF
 		// True while a drain task is already queued, so a burst of events only
 		// ever queues one.
 		bool s_drainQueued{ false };
+
+		// The engine's UpdateArmorAbility does NOT de-duplicate: calling it twice
+		// for the same item stacks the effect. Our only guard is HasItemAbility,
+		// and that can miss while a just-applied effect is not registered yet
+		// (same frame, or an inventory change landing right after an equip). So
+		// remember what we applied recently and don't repeat it inside a short
+		// window. Long enough to cover the registration lag, short enough that a
+		// genuinely lost effect is still restored on the next check.
+		constexpr auto kReapplyCooldown = std::chrono::milliseconds(500);
+
+		std::mutex s_reappliedLock;
+		std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point>
+			s_reapplied;
+
+		[[nodiscard]] std::uint64_t ApplyKey(RE::Actor* a_actor, RE::TESForm* a_form)
+		{
+			return (static_cast<std::uint64_t>(a_actor->GetFormID()) << 32) |
+			       static_cast<std::uint64_t>(a_form->GetFormID());
+		}
+
+		[[nodiscard]] bool WasAppliedRecently(std::uint64_t a_key)
+		{
+			const auto now = std::chrono::steady_clock::now();
+
+			std::scoped_lock lock(s_reappliedLock);
+
+			// Opportunistic sweep: the table only holds pairs that were touched
+			// in the last window, so it stays tiny.
+			for (auto it = s_reapplied.begin(); it != s_reapplied.end();) {
+				if (now - it->second >= kReapplyCooldown) {
+					it = s_reapplied.erase(it);
+				} else {
+					++it;
+				}
+			}
+
+			const auto it = s_reapplied.find(a_key);
+			return it != s_reapplied.end();
+		}
+
+		void NoteApplied(std::uint64_t a_key)
+		{
+			std::scoped_lock lock(s_reappliedLock);
+			s_reapplied[a_key] = std::chrono::steady_clock::now();
+		}
 
 		// Form-table lookups are not safe from every context, so every lookup
 		// we cannot remove goes through here: a bad table turns into a missing
@@ -206,7 +253,15 @@ namespace EEF
 			}
 
 			for (auto& c : candidates) {
+				const auto key = ApplyKey(a_actor, c.form);
+
 				if (HasItemAbility(a_actor, c.form, c.enchantment)) {
+					continue;
+				}
+
+				if (WasAppliedRecently(key)) {
+					// We applied this a moment ago and the engine has not
+					// exposed the effect yet. Applying again would stack it.
 					continue;
 				}
 
@@ -215,7 +270,9 @@ namespace EEF
 					c.form->GetFormID(),
 					a_actor->GetFormID());
 
-				if (!TryUpdateArmorAbility(a_actor, c.form, c.worn)) {
+				if (TryUpdateArmorAbility(a_actor, c.form, c.worn)) {
+					NoteApplied(key);
+				} else {
 					SKSE::log::error("UpdateArmorAbility faulted; skipped");
 				}
 			}
@@ -264,7 +321,7 @@ namespace EEF
 			taskInterface->AddTask([]() {
 				std::unordered_set<
 					RE::ObjectRefHandle,
-				RE::BSCRC32<RE::ObjectRefHandle>>
+					RE::BSCRC32<RE::ObjectRefHandle>>
 					batch;
 
 				{
@@ -316,25 +373,6 @@ namespace EEF
 		std::scoped_lock lock(s_queueLock);
 		s_pending.clear();
 		s_drainQueued = false;
-	}
-
-	// Called once the save has finished loading. Walks the game's own actor
-	// lists rather than the loaded-reference event stream: those lists contain
-	// only actors (tens to hundreds) and hand out live pointers directly, so
-	// there is nothing to look up and nothing to queue per reference.
-	void CheckLoadedActors()
-	{
-		auto* lists = RE::ProcessLists::GetSingleton();
-		if (!lists) {
-			return;
-		}
-
-		lists->ForAllActors([](RE::Actor* a_actor) -> RE::BSContainer::ForEachResult {
-			if (IsValidActor(a_actor)) {
-				ProcessActor(a_actor);
-			}
-			return RE::BSContainer::ForEachResult::kContinue;
-		});
 	}
 
 	void RecalcPlayerWeight()
