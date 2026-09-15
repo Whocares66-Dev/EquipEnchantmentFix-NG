@@ -15,7 +15,7 @@ namespace EEF
 		bool s_onEquip{ true };
 		bool s_onActorLoad{ true };
 		bool s_recalcWeightOnLoad{ false };
-		bool s_redirectDispel{ true };
+		bool s_redirectDispel{ false };
 
 		constexpr auto kIniPath = "Data\\SKSE\\Plugins\\EquipEnchantmentFix.ini";
 
@@ -30,7 +30,11 @@ namespace EEF
 
 		[[nodiscard]] bool IsValidActor(RE::Actor* a_actor)
 		{
-			return a_actor && !a_actor->IsDeleted() && !a_actor->IsDead();
+			// IsDeleted() / IsInitialized() read formFlags straight off the
+			// object (non-virtual). IsDead() below is virtual, but by the time
+			// it runs the pointer has already been validated by the caller
+			// (handle or live-form-table lookup), so this is safe.
+			return a_actor && !a_actor->IsDeleted() && a_actor->IsInitialized() && !a_actor->IsDead();
 		}
 
 		// The instance enchantment actually carried by a worn item's extra data.
@@ -46,6 +50,21 @@ namespace EEF
 				return extraEnch->enchantment;
 			}
 			return nullptr;
+		}
+
+		// A worn armour can only carry a constant-effect enchantment
+		// (CastingType::kConstantEffect). Anything else sitting on it is a
+		// foreign configuration -- most commonly a weapon enchantment moved
+		// onto armour by a "no enchantment restriction" mod. Feeding that to
+		// UpdateArmorAbility drives the engine down a branch it never expects
+		// and crashes (null function-pointer call). Skip it rather than
+		// trying to "restore" it.
+		[[nodiscard]] bool IsValidArmorEnchantment(RE::EnchantmentItem* a_enchantment)
+		{
+			if (!a_enchantment) {
+				return false;
+			}
+			return a_enchantment->data.castingType == RE::MagicSystem::CastingType::kConstantEffect;
 		}
 
 		[[nodiscard]] bool HasItemAbility(RE::Actor* a_actor, RE::TESForm* a_form, RE::EnchantmentItem* a_enchantment)
@@ -112,6 +131,15 @@ namespace EEF
 
 				auto* enchantment = GetWornEnchantment(worn);
 				if (!enchantment) {
+					continue;
+				}
+
+				if (!IsValidArmorEnchantment(enchantment)) {
+					SKSE::log::debug(
+						"skipping non-constant enchantment {:08X} on worn armour {:08X} (actor {:08X})",
+						enchantment->GetFormID(),
+						entry->object->GetFormID(),
+						a_actor->GetFormID());
 					continue;
 				}
 
@@ -204,7 +232,7 @@ namespace EEF
 			s_onEquip = ini.GetBoolValue("EEF", "OnEquip", true);
 			s_onActorLoad = ini.GetBoolValue("EEF", "OnActorLoad", true);
 			s_recalcWeightOnLoad = ini.GetBoolValue("EEF", "RecalcPlayerInventoryWeightOnLoad", false);
-			s_redirectDispel = ini.GetBoolValue("EEF", "RedirectDispelWornItemEnchantsVisitor", true);
+			s_redirectDispel = ini.GetBoolValue("EEF", "RedirectDispelWornItemEnchantsVisitor", false);
 
 			SKSE::log::info(
 				"settings: OnEquip={} OnActorLoad={} RecalcWeight={} RedirectDispel={}",
