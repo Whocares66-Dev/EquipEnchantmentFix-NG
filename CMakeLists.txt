@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.21)
 project(
 	EquipEnchantmentFix
 	LANGUAGES CXX
-	VERSION 1.3.20
+	VERSION 1.3.21
 )
 
 set(CMAKE_CXX_STANDARD 23)

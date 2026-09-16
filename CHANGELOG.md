@@ -1,7 +1,29 @@
 # Changelog
 
-All notable changes to the NG port. 1.3.7 - 1.3.18 were published on Nexus;
-1.3.19 was an internal build that has been folded into 1.3.20.
+All notable changes to the NG port. 1.3.7 - 1.3.21 have been released;
+1.3.19 was an internal build that was folded into 1.3.20.
+
+## 1.3.21
+
+**The engine's duplicate apply is now blocked before it happens** - the same
+mechanism the original plugin used.
+
+- Hooks the engine's call to `Actor::UpdateArmorAbility` and skips it when the
+  actor already carries that item's enchantment, matched on the same
+  `(source, spell)` pair the repair path uses. 1.3.20 could only restore an
+  enchantment after a bad dispel; this stops the duplicate apply at source, so
+  nothing blinks.
+- `RedirectDispelWornItemEnchantsVisitor` now defaults to **true**, matching the
+  original plugin. The post-hoc recheck stays as the fallback if the hook cannot
+  be installed.
+- The hook patches the call site only after verifying the byte there really is a
+  `call` (`E8`/`E9`). If a future runtime moves it, the plugin logs and falls back
+  to the recheck rather than patching blind.
+- Hooking the call site rather than the function keeps our own repair calls
+  working, since they reach the function directly.
+- Verified in game on SE 1.5.97: 42 unequip/equip cycles of an enchanted item
+  leave exactly one effect; a real unequip still removes it and re-equipping
+  restores it; load drain 0 ms; no errors in any log.
 
 ## 1.3.20
 

@@ -47,7 +47,8 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 {
 	SetupLog();
 	SKSE::log::info("EquipEnchantmentFix loading");
-	SKSE::Init(a_skse);
+	// The UpdateArmorAbility hook needs a trampoline; ask for a small one up front.
+	SKSE::Init(a_skse, SKSE::InitInfo{ .log = true, .trampoline = true, .trampolineSize = 1 << 7 });
 
 	if (!SKSE::GetMessagingInterface()->RegisterListener(OnMessage)) {
 		SKSE::log::error("Failed to register message listener");

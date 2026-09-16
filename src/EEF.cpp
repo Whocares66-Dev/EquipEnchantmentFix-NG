@@ -8,6 +8,9 @@
 #include <unordered_set>
 #include <vector>
 
+#include "REL/Relocation.h"
+#include "SKSE/Trampoline.h"
+
 #include "EEF.h"
 
 namespace EEF
@@ -17,7 +20,7 @@ namespace EEF
 		bool s_onEquip{ true };
 		bool s_onActorLoad{ true };
 		bool s_recalcWeightOnLoad{ false };
-		bool s_redirectDispel{ false };
+		bool s_redirectDispel{ true };
 
 		constexpr auto kIniPath = "Data\\SKSE\\Plugins\\EquipEnchantmentFix.ini";
 
@@ -209,6 +212,104 @@ namespace EEF
 			}
 		}
 
+		// --- engine hook -------------------------------------------------------
+		// The engine applies a worn item's enchantment through
+		// Actor::UpdateArmorAbility and does not de-duplicate: calling it a second
+		// time for the same item stacks the effect. The original plugin hooked the
+		// engine's call to it to block that before it happened; this hooks the same
+		// call site, using the exact (source, spell) check ProcessActor uses, so the
+		// block and the repair agree on what "already applied" means.
+		//
+		// Note the hook sits on the ENGINE's call site, not on the function: our own
+		// re-apply calls the function directly and therefore still goes through,
+		// which is what lets a genuinely missing enchantment be restored.
+		using UpdateArmorAbility_t = void (*)(RE::Actor*, RE::TESForm*, RE::ExtraDataList*);
+		UpdateArmorAbility_t UpdateArmorAbility_orig{ nullptr };
+
+		// The instance enchantment, or the form's own -- the engine falls back to
+		// the latter when the item carries no instance data.
+		[[nodiscard]] RE::EnchantmentItem* GetApplicableEnchantment(RE::TESForm* a_form, RE::ExtraDataList* a_extraData)
+		{
+			if (auto* instance = GetWornEnchantment(a_extraData)) {
+				return instance;
+			}
+			if (a_form) {
+				if (auto* enchantable = a_form->As<RE::TESEnchantableForm>()) {
+					return enchantable->formEnchanting;
+				}
+			}
+			return nullptr;
+		}
+
+		void UpdateArmorAbility_Hook(RE::Actor* a_actor, RE::TESForm* a_form, RE::ExtraDataList* a_extraData)
+		{
+			if (a_actor && a_form && a_form->As<RE::TESObjectARMO>()) {
+				auto* enchantment = GetApplicableEnchantment(a_form, a_extraData);
+				if (enchantment && IsValidArmorEnchantment(enchantment) &&
+					HasItemAbility(a_actor, a_form, enchantment)) {
+					// Already on the actor. Letting the engine run would stack it.
+					return;
+				}
+			}
+
+			UpdateArmorAbility_orig(a_actor, a_form, a_extraData);
+		}
+
+		// The engine reaches UpdateArmorAbility through a five-byte `call rel32`
+		// at a known offset inside its caller. That CALL SITE is what gets hooked,
+		// not the function itself: SKSE::Trampoline::write_call replaces exactly
+		// that instruction and returns the call's original target, so the real
+		// function stays untouched and callable. Patching the function entry
+		// instead corrupts it -- the trampoline does not preserve the prologue, and
+		// the "original" it hands back is computed from the prologue bytes.
+		[[nodiscard]] std::uintptr_t UpdateArmorAbilityCallSite()
+		{
+			static REL::Relocation<std::uintptr_t> caller{ REL::RelocationID(36976, 38001) };
+			if (!caller.address()) {
+				return 0;
+			}
+			return caller.address() + (REL::Module::IsAE() ? 0x36D : 0x3BB);
+		}
+
+		[[nodiscard]] bool InstallUpdateArmorAbilityHook()
+		{
+			const auto callSite = UpdateArmorAbilityCallSite();
+			if (!callSite) {
+				SKSE::log::error("UpdateArmorAbility call site could not be resolved");
+				return false;
+			}
+
+			// Only patch it when it really is the call we expect. A different
+			// opcode means these offsets do not describe this runtime, and refusing
+			// to patch is the difference between a fallback and a corrupted engine.
+			const auto opcode = *reinterpret_cast<const std::uint8_t*>(callSite);
+			if (opcode != 0xE8 && opcode != 0xE9) {
+				SKSE::log::error(
+					"UpdateArmorAbility call site has opcode {:02X}, not a call; not hooking",
+					opcode);
+				return false;
+			}
+
+			try {
+				UpdateArmorAbility_orig = reinterpret_cast<UpdateArmorAbility_t>(
+					SKSE::GetTrampoline().write_call<5>(callSite, UpdateArmorAbility_Hook));
+			} catch (const std::exception& e) {
+				SKSE::log::error("UpdateArmorAbility hook failed: {}", e.what());
+				return false;
+			} catch (...) {
+				SKSE::log::error("UpdateArmorAbility hook failed (unknown exception)");
+				return false;
+			}
+
+			if (!UpdateArmorAbility_orig) {
+				SKSE::log::error("UpdateArmorAbility hook produced a null original pointer");
+				return false;
+			}
+
+			SKSE::log::info("UpdateArmorAbility hook installed at {:X}", callSite);
+			return true;
+		}
+
 		// a_onlyForm: when the caller knows which item was just equipped
 		// (TESEquipEvent::baseObject) only that item is considered. Walking the
 		// whole inventory on every equip is what made switching weapons and
@@ -392,7 +493,7 @@ namespace EEF
 			s_onEquip = ini.GetBoolValue("EEF", "OnEquip", true);
 			s_onActorLoad = ini.GetBoolValue("EEF", "OnActorLoad", true);
 			s_recalcWeightOnLoad = ini.GetBoolValue("EEF", "RecalcPlayerInventoryWeightOnLoad", false);
-			s_redirectDispel = ini.GetBoolValue("EEF", "RedirectDispelWornItemEnchantsVisitor", false);
+			s_redirectDispel = ini.GetBoolValue("EEF", "RedirectDispelWornItemEnchantsVisitor", true);
 
 			SKSE::log::info(
 				"settings: OnEquip={} OnActorLoad={} RecalcWeight={} RedirectDispel={}",
@@ -532,6 +633,13 @@ namespace EEF
 			holder->AddEventSink<RE::TESInitScriptEvent>(LoadEventHandler::GetSingleton());
 		}
 		if (s_redirectDispel) {
+			// Blocking is the stronger half: stop the engine from applying an
+			// enchantment the actor already carries. The post-hoc recheck stays as
+			// the fallback (and as the repair for an enchantment the engine wrongly
+			// dispels), so the option keeps working even if the hook is unavailable.
+			if (!InstallUpdateArmorAbilityHook()) {
+				SKSE::log::warn("UpdateArmorAbility hook unavailable; using the post-hoc recheck only");
+			}
 			holder->AddEventSink<RE::TESActiveEffectApplyRemoveEvent>(ActiveEffectEventHandler::GetSingleton());
 		}
 
