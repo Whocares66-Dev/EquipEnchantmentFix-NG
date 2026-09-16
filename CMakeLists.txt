@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.21)
 project(
 	EquipEnchantmentFix
 	LANGUAGES CXX
-	VERSION 1.3.18
+	VERSION 1.3.20
 )
 
 set(CMAKE_CXX_STANDARD 23)
@@ -15,7 +15,7 @@ set(ENABLE_SKYRIM_AE ON CACHE BOOL " " FORCE)
 set(ENABLE_SKYRIM_VR OFF CACHE BOOL " " FORCE)
 set(BUILD_TESTS OFF CACHE BOOL "Disable CommonLib tests in consumer" FORCE)
 
-# CommonLibSSE-NG source tree (alandtse ng line).
+# CommonLibSSE-NG source tree (alan dtse ng line).
 set(COMMONLIB_SSE_FOLDER "E:/CommonLibSSE-NG-alandtse" CACHE PATH "CommonLibSSE-NG source directory")
 
 add_subdirectory(${COMMONLIB_SSE_FOLDER} CommonLibSSE EXCLUDE_FROM_ALL)

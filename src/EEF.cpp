@@ -2,9 +2,9 @@
 
 #include <SimpleIni.h>
 
+#include <atomic>
 #include <chrono>
 #include <mutex>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -33,51 +33,6 @@ namespace EEF
 		// True while a drain task is already queued, so a burst of events only
 		// ever queues one.
 		bool s_drainQueued{ false };
-
-		// The engine's UpdateArmorAbility does NOT de-duplicate: calling it twice
-		// for the same item stacks the effect. Our only guard is HasItemAbility,
-		// and that can miss while a just-applied effect is not registered yet
-		// (same frame, or an inventory change landing right after an equip). So
-		// remember what we applied recently and don't repeat it inside a short
-		// window. Long enough to cover the registration lag, short enough that a
-		// genuinely lost effect is still restored on the next check.
-		constexpr auto kReapplyCooldown = std::chrono::milliseconds(500);
-
-		std::mutex s_reappliedLock;
-		std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point>
-			s_reapplied;
-
-		[[nodiscard]] std::uint64_t ApplyKey(RE::Actor* a_actor, RE::TESForm* a_form)
-		{
-			return (static_cast<std::uint64_t>(a_actor->GetFormID()) << 32) |
-			       static_cast<std::uint64_t>(a_form->GetFormID());
-		}
-
-		[[nodiscard]] bool WasAppliedRecently(std::uint64_t a_key)
-		{
-			const auto now = std::chrono::steady_clock::now();
-
-			std::scoped_lock lock(s_reappliedLock);
-
-			// Opportunistic sweep: the table only holds pairs that were touched
-			// in the last window, so it stays tiny.
-			for (auto it = s_reapplied.begin(); it != s_reapplied.end();) {
-				if (now - it->second >= kReapplyCooldown) {
-					it = s_reapplied.erase(it);
-				} else {
-					++it;
-				}
-			}
-
-			const auto it = s_reapplied.find(a_key);
-			return it != s_reapplied.end();
-		}
-
-		void NoteApplied(std::uint64_t a_key)
-		{
-			std::scoped_lock lock(s_reappliedLock);
-			s_reapplied[a_key] = std::chrono::steady_clock::now();
-		}
 
 		// Form-table lookups are not safe from every context, so every lookup
 		// we cannot remove goes through here: a bad table turns into a missing
@@ -144,15 +99,88 @@ namespace EEF
 			return a_enchantment->data.castingType == RE::MagicSystem::CastingType::kConstantEffect;
 		}
 
-		// MSVC forbids __try in a function that needs stack unwinding, so each
-		// fault-prone engine call gets its own small, object-free helper.
-		[[nodiscard]] bool TryHasMagicEffect(RE::Actor* a_actor, RE::EffectSetting* a_effect)
+		// Result of "is this item's enchantment already on the actor". The third
+		// state matters: the walk can fault, and a fault is NOT "absent".
+		// Collapsing it to absent makes every check re-apply the effect, which is
+		// exactly how effects ended up stacking -- so a fault is reported
+		// separately and the caller skips the item instead of duplicating it.
+		enum class AbilityCheck : std::uint8_t
 		{
-			__try {
-				return a_actor->HasMagicEffect(a_effect);
-			} __except (EXCEPTION_EXECUTE_HANDLER) {
+			kMissing,  // no matching (source, spell) -> safe to apply
+			kPresent,  // the actor already carries it
+			kUnknown   // the walk faulted -> we cannot tell
+		};
+
+		std::atomic<std::uint32_t> s_abilityQueryFaults{ 0 };
+
+		// "Is this enchantment already applied" the way the original plugin
+		// answered it: walk the actor's active effects and match the (source,
+		// spell) pair, where source is the item and spell is its enchantment.
+		//
+		// Actor::HasMagicEffect looked like the portable equivalent, but it faults
+		// on every runtime tested (SE 1.5.97 included), which silently disabled
+		// the check. MagicTarget::GetActiveEffectList is a RelocateVirtual
+		// vtable-slot forwarder, so it must be reached through a correctly-offset
+		// MagicTarget* -- that is what AsMagicTarget() yields; a bare Actor* would
+		// read the wrong vtable.
+		//
+		// The walk lives outside the __try because MSVC refuses __try in a
+		// function that needs object unwinding, and the range-for iterator is
+		// such an object. A fault raised inside the call still unwinds into the
+		// caller's handler.
+		struct AbilityQuery
+		{
+			const void* source;
+			const void* spell;
+			bool        found;
+		};
+
+		[[nodiscard]] bool WalkForAbility(RE::MagicTarget* a_target, AbilityQuery* a_query)
+		{
+			auto* list = a_target->GetActiveEffectList();
+			if (!list) {
 				return false;
 			}
+
+			for (auto& effect : *list) {
+				if (effect && effect->source == a_query->source && effect->spell == a_query->spell) {
+					a_query->found = true;
+					return true;
+				}
+			}
+			return false;
+		}
+
+		[[nodiscard]] AbilityCheck TryHasItemAbility(RE::Actor* a_actor, RE::TESForm* a_form, RE::EnchantmentItem* a_enchantment)
+		{
+			if (!a_actor || !a_form || !a_enchantment) {
+				return AbilityCheck::kMissing;
+			}
+
+			auto* target = a_actor->AsMagicTarget();
+			if (!target) {
+				return AbilityCheck::kUnknown;
+			}
+
+			AbilityQuery query{ a_form, a_enchantment, false };
+
+			__try {
+				(void)WalkForAbility(target, &query);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				// Log the first fault only: a broken walk faults on every call
+				// and would otherwise flood the log.
+				if (s_abilityQueryFaults.fetch_add(1, std::memory_order_relaxed) == 0) {
+					SKSE::log::error(
+						"active-effect walk faulted (actor {:08X}, item {:08X}); ability checks are "
+						"treated as unknown from now on, so nothing will be re-applied (a missed "
+						"re-apply is harmless, a duplicate is not).",
+						a_actor->GetFormID(),
+						a_form->GetFormID());
+				}
+				return AbilityCheck::kUnknown;
+			}
+
+			return query.found ? AbilityCheck::kPresent : AbilityCheck::kMissing;
 		}
 
 		[[nodiscard]] bool TryUpdateArmorAbility(RE::Actor* a_actor, RE::TESForm* a_form, RE::ExtraDataList* a_extraData)
@@ -165,34 +193,29 @@ namespace EEF
 			}
 		}
 
-		[[nodiscard]] bool HasItemAbility(RE::Actor* a_actor, [[maybe_unused]] RE::TESForm* a_form, RE::EnchantmentItem* a_enchantment)
+		[[nodiscard]] bool HasItemAbility(RE::Actor* a_actor, RE::TESForm* a_form, RE::EnchantmentItem* a_enchantment)
 		{
-			if (!a_actor || !a_enchantment) {
+			switch (TryHasItemAbility(a_actor, a_form, a_enchantment)) {
+			case AbilityCheck::kPresent:
+				return true;
+			case AbilityCheck::kUnknown:
+				// The walk is not trustworthy on this runtime. Report "already
+				// present" so ProcessActor does not re-apply: skipping is the
+				// safe failure mode, duplicating is not.
+				return true;
+			case AbilityCheck::kMissing:
+			default:
 				return false;
 			}
-
-			// We cannot walk the actor's active effects here: both
-			// MagicTarget::GetActiveEffectList (a RelocateVirtual vtable-slot
-			// forwarder) and MagicTarget::VisitEffects fault on this setup.
-			// MagicTarget::HasMagicEffect does not -- it is a plain
-			// Address-Library call, and it is the same engine entry the Papyrus
-			// Actor.HasMagicEffect native function uses.
-			//
-			// It matches on the magic effect instead of the (source, spell)
-			// pair, so it is a coarser test: an effect granted by some other
-			// source would read as "already present". For the enchantment
-			// abilities we re-apply that is the safe direction -- worst case we
-			// skip a re-apply rather than duplicate one.
-			for (auto* effect : a_enchantment->effects) {
-				if (effect && effect->baseEffect && TryHasMagicEffect(a_actor, effect->baseEffect)) {
-					return true;
-				}
-			}
-
-			return false;
 		}
 
-		void ProcessActor(RE::Actor* a_actor)
+		// a_onlyForm: when the caller knows which item was just equipped
+		// (TESEquipEvent::baseObject) only that item is considered. Walking the
+		// whole inventory on every equip is what made switching weapons and
+		// armour stutter; the original plugin only ever looks at the equipped
+		// form. 0 means "no filter" and is what the load-time path passes,
+		// since that one has to restore every worn item.
+		void ProcessActor(RE::Actor* a_actor, RE::FormID a_onlyForm = 0)
 		{
 			if (!IsValidActor(a_actor)) {
 				return;
@@ -219,6 +242,9 @@ namespace EEF
 					continue;
 				}
 				if (!entry->object->As<RE::TESObjectARMO>()) {
+					continue;
+				}
+				if (a_onlyForm && entry->object->GetFormID() != a_onlyForm) {
 					continue;
 				}
 				if (!entry->IsWorn()) {
@@ -253,15 +279,7 @@ namespace EEF
 			}
 
 			for (auto& c : candidates) {
-				const auto key = ApplyKey(a_actor, c.form);
-
 				if (HasItemAbility(a_actor, c.form, c.enchantment)) {
-					continue;
-				}
-
-				if (WasAppliedRecently(key)) {
-					// We applied this a moment ago and the engine has not
-					// exposed the effect yet. Applying again would stack it.
 					continue;
 				}
 
@@ -270,9 +288,7 @@ namespace EEF
 					c.form->GetFormID(),
 					a_actor->GetFormID());
 
-				if (TryUpdateArmorAbility(a_actor, c.form, c.worn)) {
-					NoteApplied(key);
-				} else {
+				if (!TryUpdateArmorAbility(a_actor, c.form, c.worn)) {
 					SKSE::log::error("UpdateArmorAbility faulted; skipped");
 				}
 			}
@@ -319,6 +335,8 @@ namespace EEF
 			}
 
 			taskInterface->AddTask([]() {
+				const auto started = std::chrono::steady_clock::now();
+
 				std::unordered_set<
 					RE::ObjectRefHandle,
 					RE::BSCRC32<RE::ObjectRefHandle>>
@@ -332,6 +350,7 @@ namespace EEF
 
 				// The handle resolves to a live reference-counted pointer, so a
 				// stale actor simply resolves to nothing here.
+				std::size_t processed = 0;
 				for (const auto& handle : batch) {
 					auto ref = handle.get();
 					if (!ref) {
@@ -339,7 +358,23 @@ namespace EEF
 					}
 					if (auto* loaded = ref->As<RE::Actor>(); IsValidActor(loaded)) {
 						ProcessActor(loaded);
+						++processed;
 					}
+				}
+
+				// Whether the load-time freeze is ours is a measurement, not a
+				// guess: a long span here (or a huge batch) is us, a short one
+				// means the time goes somewhere else. One line per drain is
+				// cheap, so this stays on.
+				const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+									std::chrono::steady_clock::now() - started)
+									.count();
+				if (ms >= 25 || batch.size() >= 32) {
+					SKSE::log::info(
+						"drain: {} queued, {} processed, {} ms",
+						batch.size(),
+						processed,
+						ms);
 				}
 			});
 		}
@@ -407,7 +442,11 @@ namespace EEF
 		// touches armour, so the lookup bought us nothing but a crash.
 		if (s_onEquip && a_event && a_event->equipped && a_event->actor) {
 			if (auto* actor = a_event->actor->As<RE::Actor>(); IsValidActor(actor)) {
-				ProcessActor(actor);
+				// baseObject is a FormID read straight off the event -- no
+				// form-table lookup, which is what used to crash in this
+				// handler. It tells ProcessActor to consider only the item that
+				// was just equipped instead of rescanning the whole inventory.
+				ProcessActor(actor, a_event->baseObject);
 			}
 		}
 
