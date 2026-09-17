@@ -25,6 +25,12 @@ mechanism the original plugin used.
   leave exactly one effect; a real unequip still removes it and re-equipping
   restores it; load drain 0 ms; no errors in any log.
 
+- **License corrected to GPL-3.0-or-later.** This plugin statically links
+  CommonLibSSE-NG, which is GPL-3.0-or-later and states that a linking plugin
+  forms a combined work with it and must be GPL as well. The MIT text it
+  inherited from the original plugin is kept for attribution only (see
+  LICENSES/). Thanks to ChrysopoeiaAlchemy for pointing this out.
+
 ## 1.3.20
 
 **Fixed: enchantments could stack on repeated equips** (the duplicate-enchantment

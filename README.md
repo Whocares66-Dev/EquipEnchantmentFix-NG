@@ -1,6 +1,6 @@
 # Equip Enchantment Fix NG
 
-A CommonLibSSE-NG rewrite of [SlavicPotato's Equip Enchantment Fix](https://www.nexusmods.com/skyrimspecialedition/mods/42839) (MIT).
+A CommonLibSSE-NG rewrite of [SlavicPotato's Equip Enchantment Fix](https://www.nexusmods.com/skyrimspecialedition/mods/42839) (MIT). This port is GPL-3.0-or-later - see [License](#license).
 
 Fixes engine bugs where worn item enchantments don't apply on equip, get wrongly dispelled while still worn, or go missing after loading a save. Works on the player and NPCs.
 
@@ -45,7 +45,16 @@ RecalcPlayerInventoryWeightOnLoad=false
 
 ## Notes
 
-The original plugin redirected the engine's dispel visitor with code hooks. This port achieves the same coverage through public CommonLibSSE-NG APIs instead: a removed effect re-queues the actor for a check one frame later, so anything wrongly dispelled is restored. The end state is identical; the effect may blink for a single frame.
+The original plugin installed raw code hooks to stop a duplicate enchantment apply
+- and a bad dispel - before either happened. This port does the same: it hooks the
+engine's call to `Actor::UpdateArmorAbility` and skips it when the actor already
+carries that item's enchantment, and it re-checks an actor whose effect was removed
+so anything wrongly dispelled is restored. `RedirectDispelWornItemEnchantsVisitor`
+controls both and defaults to true, matching the original.
+
+The ability check itself is the exact test the original used: walk the actor's
+active effects and match the `(source, spell)` pair, where `source` is the item and
+`spell` is its enchantment.
 
 ## Credits
 
@@ -54,4 +63,13 @@ The original plugin redirected the engine's dispel visitor with code hooks. This
 
 ## License
 
-MIT, inherited from the original (see LICENSE).
+[GPL-3.0-or-later](COPYING.txt), with the exceptions in [EXCEPTIONS.md](EXCEPTIONS.md).
+
+That is not a choice: this plugin statically links
+[CommonLibSSE-NG](https://github.com/alandtse/CommonLibSSE-NG), which is
+GPL-3.0-or-later, and a plugin that links it forms a combined work with it.
+
+The original [Equip Enchantment Fix](https://www.nexusmods.com/skyrimspecialedition/mods/42839)
+by SlavicPotato is MIT; that text is kept at
+[LICENSES/LICENSE-MIT.txt](LICENSES/LICENSE-MIT.txt) for attribution. MIT is
+GPL-compatible, so combining it here is fine, but the combined work is GPL.
