@@ -12,8 +12,12 @@ dropped every enchantment on the armour they were wearing (Nordic Souls #183).
   on the NPC and then asks for a model update; only the update re-applies, and it
   only runs when an equipment change flagged it. A potion flags nothing. The
   original plugin's `RedirectDispelWornItemEnchantsVisitor` (1.3.5) replaced
-  that call; 1.3.6 removed it. It is replaced again: effects whose source is
-  still worn are kept, the rest are dispelled, and a re-check is queued.
+  that call; 1.3.6 removed it. It is replaced again: an effect is kept when
+  its source item and its enchantment match a worn instance, the enchantment
+  picked as the engine picks it (the record's first, then the instance's);
+  the rest are dispelled, and a re-check is queued. Matching on the item alone
+  would keep an effect while any copy of that item is worn, the case 1.3.4
+  fixed in the re-apply path.
 - The post-hoc re-check could never cover this. The engine sends the
   apply/remove event only for an effect with a unique id, and assigns the id
   only when the magic effect form's runtime flag bit 22 is set. No MGEF has

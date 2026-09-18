@@ -228,19 +228,20 @@ namespace EEF
 		using UpdateArmorAbility_t = void (*)(RE::Actor*, RE::TESForm*, RE::ExtraDataList*);
 		UpdateArmorAbility_t UpdateArmorAbility_orig{ nullptr };
 
-		// The instance enchantment, or the form's own -- the engine falls back to
-		// the latter when the item carries no instance data.
+		// The enchantment the engine applies for a worn instance: the form's own
+		// first, the instance's (ExtraEnchantment) only when the form has none.
+		// That order is the engine's, read from the routine both UpdateArmorAbility
+		// and the dispel visitor use to pick it (1.6.1170). An item carrying both
+		// gets the record's; matching the instance's instead would never find the
+		// applied effect, and the hook below would let the engine stack a copy.
 		[[nodiscard]] RE::EnchantmentItem* GetApplicableEnchantment(RE::TESForm* a_form, RE::ExtraDataList* a_extraData)
 		{
-			if (auto* instance = GetWornEnchantment(a_extraData)) {
-				return instance;
-			}
 			if (a_form) {
-				if (auto* enchantable = a_form->As<RE::TESEnchantableForm>()) {
+				if (auto* enchantable = a_form->As<RE::TESEnchantableForm>(); enchantable && enchantable->formEnchanting) {
 					return enchantable->formEnchanting;
 				}
 			}
-			return nullptr;
+			return GetWornEnchantment(a_extraData);
 		}
 
 		void UpdateArmorAbility_Hook(RE::Actor* a_actor, RE::TESForm* a_form, RE::ExtraDataList* a_extraData)
@@ -357,10 +358,21 @@ namespace EEF
 		// unequip path handles those. Split from its caller so the walk can sit
 		// under __try: MSVC refuses __try in a function that owns an object with a
 		// destructor, and the vectors live in the caller.
+		// One worn instance: the item and the enchantment the engine applied for
+		// it. An active effect records its source as the base object only, so
+		// this pair is the finest identity there is; matching on the item alone
+		// would keep an effect as long as any copy of that item is worn, which is
+		// wrong when two copies carry different enchantments and only one is on.
+		struct WornEnchantment
+		{
+			RE::TESBoundObject* source;
+			RE::MagicItem*      spell;
+		};
+
 		struct StaleQuery
 		{
-			const std::vector<RE::TESBoundObject*>* worn;
-			std::vector<RE::ActiveEffect*>*         stale;
+			const std::vector<WornEnchantment>* worn;
+			std::vector<RE::ActiveEffect*>*     stale;
 		};
 
 		void CollectStaleEffects(RE::MagicTarget* a_target, StaleQuery* a_query)
@@ -379,7 +391,10 @@ namespace EEF
 				if (!effect->source->As<RE::TESObjectARMO>()) {
 					continue;
 				}
-				if (std::find(a_query->worn->begin(), a_query->worn->end(), effect->source) == a_query->worn->end()) {
+				const auto stillWorn = std::any_of(a_query->worn->begin(), a_query->worn->end(), [&](const WornEnchantment& w) {
+					return w.source == effect->source && w.spell == effect->spell;
+				});
+				if (!stillWorn) {
 					a_query->stale->push_back(effect);
 				}
 			}
@@ -408,10 +423,21 @@ namespace EEF
 				return;
 			}
 
-			std::vector<RE::TESBoundObject*> worn;
+			// Every worn armour instance with the enchantment the engine applied
+			// for it. A stack of one base item can have more than one worn
+			// instance (two rings), each with its own extra list.
+			std::vector<WornEnchantment> worn;
 			for (auto* entry : *changes->entryList) {
-				if (entry && entry->object && entry->object->As<RE::TESObjectARMO>() && entry->IsWorn()) {
-					worn.push_back(entry->object);
+				if (!entry || !entry->object || !entry->object->As<RE::TESObjectARMO>() || !entry->extraLists) {
+					continue;
+				}
+				for (auto* xList : *entry->extraLists) {
+					if (!xList || !(xList->HasType<RE::ExtraWorn>() || xList->HasType<RE::ExtraWornLeft>())) {
+						continue;
+					}
+					if (auto* enchantment = GetApplicableEnchantment(entry->object, xList)) {
+						worn.push_back({ entry->object, enchantment });
+					}
 				}
 			}
 
