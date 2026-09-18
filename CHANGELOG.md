@@ -3,6 +3,32 @@
 All notable changes to the NG port. 1.3.7 - 1.3.21 have been released;
 1.3.19 was an internal build that was folded into 1.3.20.
 
+## 1.3.22 (wip)
+
+**The dispel redirect is back.** Giving a follower any item in the trade menu
+dropped every enchantment on the armour they were wearing (Nordic Souls #183).
+
+- The container menu's transfer routine calls `Actor::DispelWornItemEnchantments`
+  on the NPC and then asks for a model update; only the update re-applies, and it
+  only runs when an equipment change flagged it. A potion flags nothing. The
+  original plugin's `RedirectDispelWornItemEnchantsVisitor` (1.3.5) replaced
+  that call; 1.3.6 removed it. It is replaced again: effects whose source is
+  still worn are kept, the rest are dispelled, and a re-check is queued.
+- The post-hoc re-check could never cover this. The engine assigns an effect
+  its unique id, and so its apply/remove events, only when the magic effect
+  carries flag `1<<22`; enchanting-table armour enchantments do not, so
+  `TESActiveEffectApplyRemoveEvent` never fires for them. Measured on 1.6.1170.
+- Site: SE 50212+0x47B (1.3.5's numbers, unverified here); AE 51141+0x57D,
+  verified on 1.6.1170. Before patching, the plugin checks both that the byte
+  is a `call` and that the call already leads to
+  `Actor::DispelWornItemEnchantments`; otherwise it logs and leaves the engine
+  alone. The `UpdateArmorAbility` hook gets the same target check, and the
+  redirect is only installed when that hook is, since the armour trade still
+  re-equips and would stack a copy without it.
+- `SKSE::Init` no longer takes over logging (it replaced the plugin's logger
+  with one fixed at info). `LogLevel=debug` in the ini shows every step of the
+  redirect and the re-check.
+
 ## 1.3.21
 
 **The engine's duplicate apply is now blocked before it happens** - the same

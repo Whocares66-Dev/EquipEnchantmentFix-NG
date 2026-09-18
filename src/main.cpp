@@ -14,8 +14,9 @@ namespace
 		auto fileSink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(path.string(), true);
 		auto logger = std::make_shared<spdlog::logger>("log", std::move(fileSink));
 		spdlog::set_default_logger(std::move(logger));
-		spdlog::set_level(spdlog::level::trace);
-		spdlog::flush_on(spdlog::level::trace);
+		// info by default; LogLevel in the ini raises it once settings are read.
+		spdlog::set_level(spdlog::level::info);
+		spdlog::flush_on(spdlog::level::info);
 	}
 
 	void OnMessage(SKSE::MessagingInterface::Message* a_msg)
@@ -48,10 +49,11 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 	SetupLog();
 	SKSE::log::info("EquipEnchantmentFix loading");
 	// The UpdateArmorAbility hook needs a trampoline; ask for a small one up front.
-	// DIAG: .log = false keeps the trace-level logger SetupLog installed. With
-	// .log = true CommonLib replaces it with its own logger at info, and every
-	// debug line in EEF.cpp is dropped.
-	SKSE::Init(a_skse, SKSE::InitInfo{ .log = false, .trampoline = true, .trampolineSize = 1 << 7 });
+	// .log = false keeps the logger SetupLog installed. With .log = true
+	// CommonLib replaces it with its own, fixed at info, and LogLevel in the ini
+	// could never show the debug lines. Two call hooks fit in 128 bytes of
+	// trampoline (14 each); 256 leaves room.
+	SKSE::Init(a_skse, SKSE::InitInfo{ .log = false, .trampoline = true, .trampolineSize = 1 << 8 });
 
 	if (!SKSE::GetMessagingInterface()->RegisterListener(OnMessage)) {
 		SKSE::log::error("Failed to register message listener");
