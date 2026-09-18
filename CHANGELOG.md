@@ -31,6 +31,12 @@ dropped every enchantment on the armour they were wearing (Nordic Souls #183).
   alone. The `UpdateArmorAbility` hook gets the same target check, and the
   redirect is only installed when that hook is, since the armour trade still
   re-equips and would stack a copy without it.
+- The second site 1.3.5 redirected is back too. When the trade changed
+  equipment, the transfer routine's model update runs at once and a rebuild
+  helper inside it dispels every worn enchantment again before re-equipping
+  (traced on 1.6.1170 with the DiagDispelTrace detour). SE 24234+0xE3 from
+  1.3.5; on AE the helper was renumbered, 418622+0xDB, so the site is only
+  installed from 1.6.629 on.
 - A dispelled effect no longer counts as "present". Taking a worn piece off a
   follower in the trade menu makes the engine re-equip the rest, unequipping
   each first; the unequip flags the effect, the re-equip re-applies it, and the

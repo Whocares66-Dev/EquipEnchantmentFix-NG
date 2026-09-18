@@ -357,10 +357,23 @@ namespace EEF
 		// The UpdateArmorAbility hook above is the other half -- the armour
 		// trade still re-equips, and without the block that would stack a copy.
 		//
-		// Site (transfer routine + offset of the call): SE 50212+0x47B from
-		// 1.3.5; AE 51141+0x57D, 1.3.5's value, re-verified on 1.6.1170 by
-		// listing the callers of Actor::DispelWornItemEnchantments. InstallCallHook
-		// checks that the call really leads there before patching.
+		// Two sites, the same two 1.3.5 redirected:
+		//
+		// - The transfer routine itself: SE 50212+0x47B from 1.3.5; AE
+		//   51141+0x57D, 1.3.5's value, re-verified on 1.6.1170.
+		// - The model rebuild. When the trade did change equipment, the transfer
+		//   routine's model update runs at once and, four calls down, a rebuild
+		//   helper dispels every worn enchantment again before re-equipping
+		//   (traced on 1.6.1170: transfer -> Update3DModel -> ... -> the helper
+		//   -> Actor::DispelWornItemEnchantments, all twelve remaining effects).
+		//   SE 24234+0xE3 from 1.3.5. On AE the helper was reshaped in 1.6.629
+		//   and renumbered: 418622+0xDB, found by listing the callers of the
+		//   dispel; the old id 24738 is gone from those libraries, so the site
+		//   is only installed from 1.6.629 on.
+		//
+		// Both were found the same way -- list the callers of
+		// Actor::DispelWornItemEnchantments -- and InstallCallHook checks that
+		// each call really leads there before patching.
 		using DispelWornItemEnchantments_t = void (*)(RE::Actor*);
 		DispelWornItemEnchantments_t DispelWornItemEnchantments_orig{ nullptr };
 
@@ -482,12 +495,34 @@ namespace EEF
 			ScheduleActorCheck(a_actor);
 		}
 
+		// One original pointer serves both sites: write_call returns the call's
+		// former target, which is the same function at each.
 		[[nodiscard]] bool InstallDispelRedirect()
 		{
-			static REL::Relocation<std::uintptr_t> caller{ REL::RelocationID(50212, 51141) };
 			static REL::Relocation<std::uintptr_t> callee{ REL::RelocationID(33828, 34620) };
-			const auto site = caller.address() + (REL::Module::IsAE() ? 0x57D : 0x47B);
-			return InstallCallHook("DispelWornItemEnchantments (container transfer)", site, callee.address(), &DispelWornItemEnchantments_Hook, DispelWornItemEnchantments_orig);
+
+			static REL::Relocation<std::uintptr_t> transfer{ REL::RelocationID(50212, 51141) };
+			const auto transferSite = transfer.address() + (REL::Module::IsAE() ? 0x57D : 0x47B);
+			if (!InstallCallHook("DispelWornItemEnchantments (container transfer)", transferSite, callee.address(), &DispelWornItemEnchantments_Hook, DispelWornItemEnchantments_orig)) {
+				return false;
+			}
+
+			std::uintptr_t rebuildSite = 0;
+			if (REL::Module::IsSE()) {
+				static REL::Relocation<std::uintptr_t> rebuild{ REL::ID(24234) };
+				rebuildSite = rebuild.address() + 0xE3;
+			} else if (REL::Module::IsAE() && REL::Module::get().version() >= REL::Version(1, 6, 629, 0)) {
+				static REL::Relocation<std::uintptr_t> rebuild{ REL::ID(418622) };
+				rebuildSite = rebuild.address() + 0xDB;
+			} else {
+				SKSE::log::warn("DispelWornItemEnchantments (model rebuild): no known site on this runtime; an armour trade will still drop the other worn enchantments until the menu closes");
+				return true;
+			}
+			DispelWornItemEnchantments_t rebuildOrig{ nullptr };
+			if (InstallCallHook("DispelWornItemEnchantments (model rebuild)", rebuildSite, callee.address(), &DispelWornItemEnchantments_Hook, rebuildOrig)) {
+				DispelWornItemEnchantments_orig = rebuildOrig;
+			}
+			return true;
 		}
 
 		// a_onlyForm: when the caller knows which item was just equipped
