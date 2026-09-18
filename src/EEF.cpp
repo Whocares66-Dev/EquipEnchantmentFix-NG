@@ -338,6 +338,8 @@ namespace EEF
 			};
 			std::vector<Candidate> candidates;
 
+			SKSE::log::info("DIAG re-check actor {:08X} filter {:08X}", a_actor->GetFormID(), a_onlyForm);
+
 			for (auto* entry : *changes->entryList) {
 				if (!entry || !entry->object) {
 					continue;
@@ -363,6 +365,10 @@ namespace EEF
 				}
 
 				auto* enchantment = GetWornEnchantment(worn);
+				SKSE::log::info("DIAG   worn armour {:08X} wornList={} instanceEnch={:08X} casting={}",
+					entry->object->GetFormID(), worn != nullptr,
+					enchantment ? enchantment->GetFormID() : 0,
+					enchantment ? static_cast<int>(enchantment->data.castingType) : -1);
 				if (!enchantment) {
 					continue;
 				}
@@ -380,12 +386,16 @@ namespace EEF
 			}
 
 			for (auto& c : candidates) {
-				if (HasItemAbility(a_actor, c.form, c.enchantment)) {
+				const auto check = TryHasItemAbility(a_actor, c.form, c.enchantment);
+				SKSE::log::info("DIAG   ability check {:08X}/{:08X} -> {}", c.form->GetFormID(),
+					c.enchantment->GetFormID(),
+					check == AbilityCheck::kPresent ? "present" : check == AbilityCheck::kMissing ? "missing" : "unknown");
+				if (check != AbilityCheck::kMissing) {
 					continue;
 				}
 
-				SKSE::log::debug(
-					"re-applying enchantment ability for {:08X} on actor {:08X}",
+				SKSE::log::info(
+					"DIAG   re-applying enchantment ability for {:08X} on actor {:08X}",
 					c.form->GetFormID(),
 					a_actor->GetFormID());
 
@@ -418,6 +428,8 @@ namespace EEF
 			if (!handle) {
 				return;
 			}
+
+			SKSE::log::info("DIAG queued re-check for {:08X}", actor->GetFormID());
 
 			{
 				std::scoped_lock lock(s_queueLock);
@@ -470,13 +482,11 @@ namespace EEF
 				const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 									std::chrono::steady_clock::now() - started)
 									.count();
-				if (ms >= 25 || batch.size() >= 32) {
-					SKSE::log::info(
-						"drain: {} queued, {} processed, {} ms",
-						batch.size(),
-						processed,
-						ms);
-				}
+				SKSE::log::info(
+					"DIAG drain: {} queued, {} processed, {} ms",
+					batch.size(),
+					processed,
+					ms);
 			});
 		}
 
@@ -589,6 +599,10 @@ namespace EEF
 		// worn item's enchantment, the engine may have dispelled it wrongly; queue a
 		// re-check and ProcessActor will re-apply the missing ability.
 		if (s_redirectDispel && a_event && !a_event->isApplied) {
+			SKSE::log::info("DIAG effect removed: uid {} target {:08X} caster {:08X}",
+				a_event->activeEffectUniqueID,
+				a_event->target ? a_event->target->GetFormID() : 0,
+				a_event->caster ? a_event->caster->GetFormID() : 0);
 			if (a_event->target) {
 				ScheduleActorCheck(a_event->target.get());
 			}

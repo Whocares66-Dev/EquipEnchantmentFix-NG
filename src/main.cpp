@@ -48,7 +48,10 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 	SetupLog();
 	SKSE::log::info("EquipEnchantmentFix loading");
 	// The UpdateArmorAbility hook needs a trampoline; ask for a small one up front.
-	SKSE::Init(a_skse, SKSE::InitInfo{ .log = true, .trampoline = true, .trampolineSize = 1 << 7 });
+	// DIAG: .log = false keeps the trace-level logger SetupLog installed. With
+	// .log = true CommonLib replaces it with its own logger at info, and every
+	// debug line in EEF.cpp is dropped.
+	SKSE::Init(a_skse, SKSE::InitInfo{ .log = false, .trampoline = true, .trampolineSize = 1 << 7 });
 
 	if (!SKSE::GetMessagingInterface()->RegisterListener(OnMessage)) {
 		SKSE::log::error("Failed to register message listener");

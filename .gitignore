@@ -1,24 +1,3 @@
-# CMake build trees
 build/
-build-*/
-out/
-
-# vcpkg artifacts (recreated by the build)
-vcpkg_installed/
-
-# Visual Studio / VS Code
-.vs/
-*.user
-*.suo
-.vscode/
-
-# Compiled objects and debug databases
-*.obj
-*.pdb
-*.ilk
-*.exp
-*.lib
-*.dll
-
-# Logs
-*.log
+dist/
+build-diag.log
