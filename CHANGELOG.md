@@ -31,6 +31,13 @@ dropped every enchantment on the armour they were wearing (Nordic Souls #183).
   alone. The `UpdateArmorAbility` hook gets the same target check, and the
   redirect is only installed when that hook is, since the armour trade still
   re-equips and would stack a copy without it.
+- A dispelled effect no longer counts as "present". Taking a worn piece off a
+  follower in the trade menu makes the engine re-equip the rest, unequipping
+  each first; the unequip flags the effect, the re-equip re-applies it, and the
+  flagged copy stays listed until the actor's next update, after the menu.
+  Counting it as present blocked the re-apply, so every enchantment was off
+  until the menu closed. Both the de-dup hook and the re-check skip flagged
+  copies now, as the engine's own dispel-and-recast does.
 - `SKSE::Init` no longer takes over logging (it replaced the plugin's logger
   with one fixed at info). `LogLevel=debug` in the ini shows every step of the
   redirect and the re-check.

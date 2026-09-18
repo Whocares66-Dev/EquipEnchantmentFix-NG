@@ -148,10 +148,22 @@ namespace EEF
 			}
 
 			for (auto& effect : *list) {
-				if (effect && effect->source == a_query->source && effect->spell == a_query->spell) {
-					a_query->found = true;
-					return true;
+				if (!effect || effect->source != a_query->source || effect->spell != a_query->spell) {
+					continue;
 				}
+				// A dispelled effect is on its way out: flagged now, finished and
+				// unlinked at the actor's next update, which a paused menu holds
+				// off. It is not "present". The engine's re-equip of a worn item
+				// unequips first, so its re-apply arrives while the old copy is
+				// still listed; counting that copy blocked the re-apply and left
+				// the actor without the enchantment until the menu closed. The
+				// engine's own dispel-and-recast routine re-applies over flagged
+				// copies the same way; each copy reverses only its own modifier.
+				if (effect->flags.any(RE::ActiveEffect::Flag::kDispelled)) {
+					continue;
+				}
+				a_query->found = true;
+				return true;
 			}
 			return false;
 		}
