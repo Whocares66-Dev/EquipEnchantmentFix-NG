@@ -14,10 +14,12 @@ dropped every enchantment on the armour they were wearing (Nordic Souls #183).
   original plugin's `RedirectDispelWornItemEnchantsVisitor` (1.3.5) replaced
   that call; 1.3.6 removed it. It is replaced again: effects whose source is
   still worn are kept, the rest are dispelled, and a re-check is queued.
-- The post-hoc re-check could never cover this. The engine assigns an effect
-  its unique id, and so its apply/remove events, only when the magic effect
-  carries flag `1<<22`; enchanting-table armour enchantments do not, so
-  `TESActiveEffectApplyRemoveEvent` never fires for them. Measured on 1.6.1170.
+- The post-hoc re-check could never cover this. The engine sends the
+  apply/remove event only for an effect with a unique id, and assigns the id
+  only when the magic effect form's runtime flag bit 22 is set. No MGEF has
+  that bit on disk; the engine sets it at load, by all appearances for effects
+  with a script attached. A plain enchantment effect never gets one, so
+  `TESActiveEffectApplyRemoveEvent` never fires for it. Measured on 1.6.1170.
 - Site: SE 50212+0x47B (1.3.5's numbers, unverified here); AE 51141+0x57D,
   verified on 1.6.1170. Before patching, the plugin checks both that the byte
   is a `call` and that the call already leads to

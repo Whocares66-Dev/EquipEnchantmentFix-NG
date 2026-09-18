@@ -328,9 +328,13 @@ namespace EEF
 		// flags every effect those items are the source of; the model update is
 		// what re-applies them, and it only rebuilds when an equipment change
 		// flagged it. Giving a potion flags nothing, so the dispel is never
-		// undone. Those effects also never raise the apply/remove event (the
-		// engine assigns it only to effects whose magic effect carries flag 1<<22),
-		// so the post-hoc re-check below cannot see them go.
+		// undone. Those effects also never raise the apply/remove event: the
+		// engine sends it only for an effect with a unique id, and assigns the id
+		// only when the magic effect form's runtime flag bit 22 is set. No MGEF
+		// carries that bit on disk; the engine sets it at load, by all
+		// appearances for effects with a script attached, which are the ones
+		// the VM has to address by id. So the post-hoc re-check below cannot
+		// see a plain enchantment effect go.
 		//
 		// The original plugin's RedirectDispelWornItemEnchantsVisitor (1.3.5)
 		// replaced the call at this site, and 1.3.6 removed it. This is that
