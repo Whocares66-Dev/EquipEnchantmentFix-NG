@@ -27,22 +27,12 @@ add_commonlibsse_plugin(${PROJECT_NAME}
 	SOURCES
 		src/main.cpp
 		src/EEF.cpp
-		src/DispelTrace.cpp
 )
 
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_23)
 target_compile_definitions(${PROJECT_NAME} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_precompile_headers(${PROJECT_NAME} PRIVATE include/PCH.h)
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-
-# Microsoft Detours, for the diagnostic function-entry hook on ActiveEffect::Dispel
-# (src/DispelTrace.cpp). CommonLib's write_call/write_branch overwrite an existing
-# instruction and preserve nothing, so they cannot detour a function's first bytes;
-# Detours relocates the displaced prologue and hands back a callable original.
-find_path(DETOURS_INCLUDE_DIRS "detours/detours.h" REQUIRED)
-find_library(DETOURS_LIBRARY detours REQUIRED)
-target_include_directories(${PROJECT_NAME} PRIVATE ${DETOURS_INCLUDE_DIRS})
-target_link_libraries(${PROJECT_NAME} PRIVATE ${DETOURS_LIBRARY})
 
 # Source/execution charset: the workspace path is non-ASCII (Chinese) and MSVC
 # reads sources with the system code page by default, tripping C4828 on the

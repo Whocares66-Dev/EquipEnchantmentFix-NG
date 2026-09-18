@@ -4,13 +4,6 @@ namespace EEF
 {
 	bool Initialize();
 
-	// Diagnostic (DiagDispelTrace=true): log every dispel of an armour-sourced
-	// effect on a teammate with the call stack that led to it.
-	namespace DispelTrace
-	{
-		bool Install();
-	}
-
 	// Drop every queued actor re-check (new game / load game).
 	void ClearPendingChecks();
 

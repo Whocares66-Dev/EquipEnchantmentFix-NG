@@ -24,7 +24,6 @@ namespace EEF
 		bool s_onActorLoad{ true };
 		bool s_recalcWeightOnLoad{ false };
 		bool s_redirectDispel{ true };
-		bool s_diagDispelTrace{ false };
 
 		constexpr auto kIniPath = "Data\\SKSE\\Plugins\\EquipEnchantmentFix.ini";
 
@@ -785,7 +784,6 @@ namespace EEF
 			s_onActorLoad = ini.GetBoolValue("EEF", "OnActorLoad", true);
 			s_recalcWeightOnLoad = ini.GetBoolValue("EEF", "RecalcPlayerInventoryWeightOnLoad", false);
 			s_redirectDispel = ini.GetBoolValue("EEF", "RedirectDispelWornItemEnchantsVisitor", true);
-			s_diagDispelTrace = ini.GetBoolValue("EEF", "DiagDispelTrace", false);
 
 			// The file logger is at info by default; "debug" shows every step of the
 			// re-check and the redirect, which is what settled Nordic Souls #183.
@@ -920,10 +918,6 @@ namespace EEF
 			} else if (!InstallDispelRedirect()) {
 				SKSE::log::warn("dispel redirect unavailable; worn enchantments will still drop on an inventory change");
 			}
-		}
-
-		if (s_diagDispelTrace) {
-			(void)DispelTrace::Install();
 		}
 
 		SKSE::log::info(

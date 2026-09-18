@@ -10,49 +10,40 @@ dropped every enchantment on the armour they were wearing (Nordic Souls #183).
 
 - The container menu's transfer routine calls `Actor::DispelWornItemEnchantments`
   on the NPC and then asks for a model update; only the update re-applies, and it
-  only runs when an equipment change flagged it. A potion flags nothing. The
-  original plugin's `RedirectDispelWornItemEnchantsVisitor` (1.3.5) replaced
-  that call; 1.3.6 removed it. It is replaced again: an effect is kept when
-  its source item and its enchantment match a worn instance, the enchantment
-  picked as the engine picks it (the record's first, then the instance's);
-  the rest are dispelled, and a re-check is queued. Matching on the item alone
-  would keep an effect while any copy of that item is worn, the case 1.3.4
-  fixed in the re-apply path.
-- The post-hoc re-check could never cover this. The engine sends the
-  apply/remove event only for an effect with a unique id, and assigns the id
-  only when the magic effect form's runtime flag bit 22 is set. No MGEF has
-  that bit on disk; the engine sets it at load, by all appearances for effects
-  with a script attached. A plain enchantment effect never gets one, so
-  `TESActiveEffectApplyRemoveEvent` never fires for it. Measured on 1.6.1170.
-- Site: SE 50212+0x47B (1.3.5's numbers, unverified here); AE 51141+0x57D,
-  verified on 1.6.1170. Before patching, the plugin checks both that the byte
-  is a `call` and that the call already leads to
-  `Actor::DispelWornItemEnchantments`; otherwise it logs and leaves the engine
-  alone. The `UpdateArmorAbility` hook gets the same target check, and the
-  redirect is only installed when that hook is, since the armour trade still
-  re-equips and would stack a copy without it.
-- The second site 1.3.5 redirected is back too. When the trade changed
-  equipment, the transfer routine's model update runs at once and a rebuild
-  helper inside it dispels every worn enchantment again before re-equipping
-  (traced on 1.6.1170 with the DiagDispelTrace detour). SE 24234+0xE3 from
-  1.3.5; on AE the helper was renumbered, 418622+0xDB, so the site is only
-  installed from 1.6.629 on.
-- A dispelled effect no longer counts as "present". Taking a worn piece off a
-  follower in the trade menu makes the engine re-equip the rest, unequipping
-  each first; the unequip flags the effect, the re-equip re-applies it, and the
-  flagged copy stays listed until the actor's next update, after the menu.
-  Counting it as present blocked the re-apply, so every enchantment was off
-  until the menu closed. Both the de-dup hook and the re-check skip flagged
-  copies now, as the engine's own dispel-and-recast does.
-- Call sites are found at launch from the caller's and callee's ids (the one
-  `call` inside the caller that lands on the callee), so no offset is carried
-  for any version. The rebuild helper's site is found without its id, since
-  the id was renumbered at 1.6.629 and a lookup of an absent id is fatal.
+  only runs when an equipment change flagged it. A potion flags nothing. When
+  equipment did change, the update runs at once and a rebuild helper inside it
+  dispels everything again, then runs the actor's magic update with a zero
+  step, so the old effects finish on the spot while the re-equipped copies
+  only start at the next update, after the menu. Measured on 1.6.1170.
+- Both calls, the same two the original plugin's
+  `RedirectDispelWornItemEnchantsVisitor` (1.3.5) replaced and 1.3.6 dropped,
+  now go to a replacement that keeps an effect when its source item and its
+  enchantment match a worn instance and dispels the rest. The enchantment is
+  picked as the engine picks it, the record's first, then the instance's.
+  Nothing worn is ever dispelled, so nothing has to be re-applied and the
+  numbers are right while the menu is open. Matching on the item alone would
+  keep an effect while any copy of that item is worn, the case 1.3.4 fixed in
+  the re-apply path. The redirect is only installed when the
+  `UpdateArmorAbility` hook is, since the armour trade's re-equip would stack a
+  copy without it.
+- Call sites are found at launch from the caller's and the callee's ids: the
+  one `call` inside the caller that lands on the callee, the caller bounded by
+  the next function the Address Library maps. No offset is carried for any
+  version; a caller with no such call, or two, is refused and logged. The
+  rebuild helper was renumbered at 1.6.629 and a lookup of an absent id is
+  fatal, so on AE its site is found without its id, as the one caller of the
+  dispel that is neither the transfer routine nor the dispel-and-recast one.
+- A dispelled effect no longer counts as "present". The engine's re-equip of a
+  worn item unequips first, which flags the effect; the flagged copy stays
+  listed until the actor's next update, and counting it blocked the re-apply.
+  Both the de-dup hook and the re-check skip flagged copies now, as the
+  engine's own dispel-and-recast does.
 - Removed the re-check on `TESActiveEffectApplyRemoveEvent` (the 1.3.9 -
-  1.3.21 "RedirectDispel"): worn enchantment effects never raise that event,
-  so it only ever re-checked actors after spell effects ended, for nothing.
-  The re-check queued from the redirect is gone too; with nothing worn
-  dispelled there is nothing for it to restore.
+  1.3.21 "RedirectDispel"). The engine sends that event only for an effect
+  with a unique id, and assigns one only when the magic effect form's runtime
+  flag bit 22 is set, which no MGEF has on disk and which by all appearances
+  marks scripted effects. A plain enchantment effect never raises it, so the
+  re-check only ever ran after spell effects ended, for nothing.
 - `SKSE::Init` no longer takes over logging (it replaced the plugin's logger
   with one fixed at info). `LogLevel=debug` in the ini shows every step of the
   redirect and the re-check.
