@@ -47,19 +47,4 @@ namespace EEF
 			const RE::TESInitScriptEvent*               a_event,
 			RE::BSTEventSource<RE::TESInitScriptEvent>* a_eventSource) override;
 	};
-
-	// The engine can wrongly dispel a worn item's enchantment while the inventory
-	// changes. Without a hook we cannot redirect the engine's dispel visitor, so
-	// instead we watch for a removed effect and re-check the affected actor a
-	// frame later -- ProcessActor re-applies anything that was wrongly taken.
-	class ActiveEffectEventHandler final :
-		public RE::BSTEventSink<RE::TESActiveEffectApplyRemoveEvent>
-	{
-	public:
-		static ActiveEffectEventHandler* GetSingleton();
-
-		RE::BSEventNotifyControl ProcessEvent(
-			const RE::TESActiveEffectApplyRemoveEvent*               a_event,
-			RE::BSTEventSource<RE::TESActiveEffectApplyRemoveEvent>* a_eventSource) override;
-	};
 }

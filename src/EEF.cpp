@@ -290,22 +290,11 @@ namespace EEF
 		template <class Fn>
 		[[nodiscard]] bool InstallCallHook(const char* a_what, std::uintptr_t a_callSite, std::uintptr_t a_expectedTarget, Fn a_hook, Fn& a_orig)
 		{
+			// The site comes from FindCallSite, which only ever returns a `call
+			// rel32` whose target is the callee; nothing to re-check here.
+			(void)a_expectedTarget;
 			if (!a_callSite) {
 				SKSE::log::error("{} call site could not be resolved", a_what);
-				return false;
-			}
-
-			const auto* bytes = reinterpret_cast<const std::uint8_t*>(a_callSite);
-			if (bytes[0] != 0xE8) {
-				SKSE::log::error("{} call site has opcode {:02X}, not a call; not hooking", a_what, bytes[0]);
-				return false;
-			}
-
-			std::int32_t rel = 0;
-			std::memcpy(&rel, bytes + 1, sizeof(rel));
-			const auto target = a_callSite + 5 + static_cast<std::uintptr_t>(static_cast<std::intptr_t>(rel));
-			if (a_expectedTarget && target != a_expectedTarget) {
-				SKSE::log::error("{} call site calls {:X}, expected {:X}; not hooking", a_what, target, a_expectedTarget);
 				return false;
 			}
 
@@ -431,8 +420,6 @@ namespace EEF
 		using DispelWornItemEnchantments_t = void (*)(RE::Actor*);
 		DispelWornItemEnchantments_t DispelWornItemEnchantments_orig{ nullptr };
 
-		void ScheduleActorCheck(RE::TESObjectREFR* a_ref);
-
 		// The effects to dispel: sourced by an armour the actor no longer wears.
 		// Weapons are left alone as the engine's own visitor leaves them; the
 		// unequip path handles those. Split from its caller so the walk can sit
@@ -545,8 +532,6 @@ namespace EEF
 
 			SKSE::log::debug("dispel redirect: actor {:08X}, {} worn armour kept, {} stale effect(s) dispelled",
 				a_actor->GetFormID(), worn.size(), stale.size());
-
-			ScheduleActorCheck(a_actor);
 		}
 
 		// The rebuild helper's site, without its id. The helper was renumbered
@@ -895,26 +880,6 @@ namespace EEF
 		return RE::BSEventNotifyControl::kContinue;
 	}
 
-	RE::BSEventNotifyControl ActiveEffectEventHandler::ProcessEvent(
-		const RE::TESActiveEffectApplyRemoveEvent*               a_event,
-		RE::BSTEventSource<RE::TESActiveEffectApplyRemoveEvent>*)
-	{
-		// isApplied == false means an active effect was removed. If it belonged to a
-		// worn item's enchantment, the engine may have dispelled it wrongly; queue a
-		// re-check and ProcessActor will re-apply the missing ability.
-		if (s_redirectDispel && a_event && !a_event->isApplied) {
-			SKSE::log::debug("effect removed: uid {} target {:08X} caster {:08X}",
-				a_event->activeEffectUniqueID,
-				a_event->target ? a_event->target->GetFormID() : 0,
-				a_event->caster ? a_event->caster->GetFormID() : 0);
-			if (a_event->target) {
-				ScheduleActorCheck(a_event->target.get());
-			}
-		}
-
-		return RE::BSEventNotifyControl::kContinue;
-	}
-
 	EquipEventHandler* EquipEventHandler::GetSingleton()
 	{
 		static EquipEventHandler singleton;
@@ -924,12 +889,6 @@ namespace EEF
 	LoadEventHandler* LoadEventHandler::GetSingleton()
 	{
 		static LoadEventHandler singleton;
-		return &singleton;
-	}
-
-	ActiveEffectEventHandler* ActiveEffectEventHandler::GetSingleton()
-	{
-		static ActiveEffectEventHandler singleton;
 		return &singleton;
 	}
 
@@ -953,16 +912,14 @@ namespace EEF
 		if (s_redirectDispel) {
 			// Two halves. The redirect keeps worn enchantments through an inventory
 			// change; the block stops the engine's re-equip from stacking a copy of
-			// what was kept. The post-hoc recheck stays as the fallback for
-			// whichever cannot be installed on this runtime.
+			// what was kept. Without the block the redirect must not go in, since
+			// the armour trade's re-equip would then stack a copy.
 			const bool blocked = InstallUpdateArmorAbilityHook();
 			if (!blocked) {
-				SKSE::log::warn("UpdateArmorAbility hook unavailable; using the post-hoc recheck only");
-			}
-			if (blocked && !InstallDispelRedirect()) {
+				SKSE::log::warn("UpdateArmorAbility hook unavailable; the dispel redirect is not installed either, and worn enchantments will drop on an inventory change");
+			} else if (!InstallDispelRedirect()) {
 				SKSE::log::warn("dispel redirect unavailable; worn enchantments will still drop on an inventory change");
 			}
-			holder->AddEventSink<RE::TESActiveEffectApplyRemoveEvent>(ActiveEffectEventHandler::GetSingleton());
 		}
 
 		if (s_diagDispelTrace) {

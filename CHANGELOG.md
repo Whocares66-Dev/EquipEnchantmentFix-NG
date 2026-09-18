@@ -44,6 +44,15 @@ dropped every enchantment on the armour they were wearing (Nordic Souls #183).
   Counting it as present blocked the re-apply, so every enchantment was off
   until the menu closed. Both the de-dup hook and the re-check skip flagged
   copies now, as the engine's own dispel-and-recast does.
+- Call sites are found at launch from the caller's and callee's ids (the one
+  `call` inside the caller that lands on the callee), so no offset is carried
+  for any version. The rebuild helper's site is found without its id, since
+  the id was renumbered at 1.6.629 and a lookup of an absent id is fatal.
+- Removed the re-check on `TESActiveEffectApplyRemoveEvent` (the 1.3.9 -
+  1.3.21 "RedirectDispel"): worn enchantment effects never raise that event,
+  so it only ever re-checked actors after spell effects ended, for nothing.
+  The re-check queued from the redirect is gone too; with nothing worn
+  dispelled there is nothing for it to restore.
 - `SKSE::Init` no longer takes over logging (it replaced the plugin's logger
   with one fixed at info). `LogLevel=debug` in the ini shows every step of the
   redirect and the re-check.
