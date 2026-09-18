@@ -33,7 +33,11 @@ namespace EEF::DispelTrace
 				std::wstring wide(path);
 				const auto slash = wide.find_last_of(L"\\/");
 				const std::wstring name = slash == std::wstring::npos ? wide : wide.substr(slash + 1);
-				std::string narrow(name.begin(), name.end());
+				// Module file names here are ASCII; anything else becomes '?'.
+				std::string narrow;
+				for (const wchar_t c : name) {
+					narrow.push_back(c < 0x80 ? static_cast<char>(c) : '?');
+				}
 				return std::format("{}+{:#x}", narrow, reinterpret_cast<std::uintptr_t>(a_address) - reinterpret_cast<std::uintptr_t>(module));
 			}
 			return std::format("{:#x}", reinterpret_cast<std::uintptr_t>(a_address));
