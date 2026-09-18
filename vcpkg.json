@@ -5,6 +5,7 @@
   "builtin-baseline": "ee12231b20c95013c6638d845d04c91559a1d1ff",
   "dependencies": [
     { "name": "vcpkg-cmake-config", "host": true },
+    { "name": "detours" },
     { "name": "directxmath", "version>=": "2025-04-03" },
     { "name": "directxtk", "version>=": "2025-10-27" },
     { "name": "fmt", "version>=": "12.1.0" },
