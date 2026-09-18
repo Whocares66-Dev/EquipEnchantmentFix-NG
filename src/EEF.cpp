@@ -10,6 +10,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "REL/Offset2ID.h"
 #include "REL/Relocation.h"
 #include "SKSE/Trampoline.h"
 
@@ -327,12 +328,69 @@ namespace EEF
 			return true;
 		}
 
+		// --- finding the call sites at launch ----------------------------------
+		// A call site is a function start plus an offset into its body. The start
+		// is the Address Library's and stable; the offset is nobody's and moves
+		// with every build, which is what made the original plugin carry four
+		// numbers per hook and re-verify them per version. But the offset is a
+		// derived fact: given the caller's id and the callee's id, the site is
+		// the one `call rel32` inside the caller that lands on the callee. So it
+		// is found here at launch rather than carried. The caller's extent runs
+		// from its start to the next function the library maps; a caller with no
+		// such call, or with two, is refused. This holds on every version the
+		// library covers and verifies on the machine it runs on, which a table of
+		// offsets never does.
+		[[nodiscard]] std::uintptr_t EndOfFunction(std::uintptr_t a_start)
+		{
+			// Every mapped offset, sorted; built once (hundreds of thousands of
+			// entries, a few milliseconds).
+			static const REL::Offset2ID table;
+			const auto base = REL::Module::get().base();
+			const auto offset = a_start - base;
+			const auto next = std::upper_bound(table.begin(), table.end(), offset, [](std::uint64_t a_lhs, const REL::IDDB::mapping_t& a_rhs) {
+				return a_lhs < a_rhs.offset;
+			});
+			return next != table.end() ? base + next->offset : a_start + 0x1000;
+		}
+
+		// Every `call rel32` in [a_begin, a_end) whose target is a_callee.
+		[[nodiscard]] std::vector<std::uintptr_t> CallsTo(std::uintptr_t a_begin, std::uintptr_t a_end, std::uintptr_t a_callee)
+		{
+			std::vector<std::uintptr_t> sites;
+			const auto* bytes = reinterpret_cast<const std::uint8_t*>(a_begin);
+			for (std::size_t i = 0; i + 5 <= a_end - a_begin; ++i) {
+				if (bytes[i] != 0xE8) {
+					continue;
+				}
+				std::int32_t rel = 0;
+				std::memcpy(&rel, bytes + i + 1, sizeof(rel));
+				if (a_begin + i + 5 + static_cast<std::uintptr_t>(static_cast<std::intptr_t>(rel)) == a_callee) {
+					sites.push_back(a_begin + i);
+				}
+			}
+			return sites;
+		}
+
+		// The one call to a_callee inside the function starting at a_caller, or 0.
+		[[nodiscard]] std::uintptr_t FindCallSite(const char* a_what, std::uintptr_t a_caller, std::uintptr_t a_callee)
+		{
+			const auto end = EndOfFunction(a_caller);
+			const auto sites = CallsTo(a_caller, end, a_callee);
+			if (sites.size() != 1) {
+				SKSE::log::error("{}: {} call(s) to the callee inside the caller at {:X} (extent {:#x}); not hooking",
+					a_what, sites.size(), a_caller, end - a_caller);
+				return 0;
+			}
+			SKSE::log::info("{}: call site found at {:X} (caller +{:#x})", a_what, sites[0], sites[0] - a_caller);
+			return sites[0];
+		}
+
 		[[nodiscard]] bool InstallUpdateArmorAbilityHook()
 		{
 			static REL::Relocation<std::uintptr_t> caller{ REL::RelocationID(36976, 38001) };
 			static REL::Relocation<std::uintptr_t> callee{ REL::RelocationID(37802, 38751) };
-			const auto site = caller.address() + (REL::Module::IsAE() ? 0x36D : 0x3BB);
-			return InstallCallHook("UpdateArmorAbility", site, callee.address(), &UpdateArmorAbility_Hook, UpdateArmorAbility_orig);
+			const auto site = FindCallSite("UpdateArmorAbility", caller.address(), callee.address());
+			return site && InstallCallHook("UpdateArmorAbility", site, callee.address(), &UpdateArmorAbility_Hook, UpdateArmorAbility_orig);
 		}
 
 		// --- the dispel redirect ----------------------------------------------
@@ -357,23 +415,19 @@ namespace EEF
 		// The UpdateArmorAbility hook above is the other half -- the armour
 		// trade still re-equips, and without the block that would stack a copy.
 		//
-		// Two sites, the same two 1.3.5 redirected:
+		// Two sites, the same two 1.3.5 redirected, found at launch (see
+		// FindCallSite) rather than carried as offsets:
 		//
-		// - The transfer routine itself: SE 50212+0x47B from 1.3.5; AE
-		//   51141+0x57D, 1.3.5's value, re-verified on 1.6.1170.
+		// - The transfer routine itself (SE 50212, AE 51141): its one call to
+		//   the dispel. 1.3.5 carried it as +0x47B / +0x57D.
 		// - The model rebuild. When the trade did change equipment, the transfer
 		//   routine's model update runs at once and, four calls down, a rebuild
 		//   helper dispels every worn enchantment again before re-equipping
 		//   (traced on 1.6.1170: transfer -> Update3DModel -> ... -> the helper
 		//   -> Actor::DispelWornItemEnchantments, all twelve remaining effects).
-		//   SE 24234+0xE3 from 1.3.5. On AE the helper was reshaped in 1.6.629
-		//   and renumbered: 418622+0xDB, found by listing the callers of the
-		//   dispel; the old id 24738 is gone from those libraries, so the site
-		//   is only installed from 1.6.629 on.
-		//
-		// Both were found the same way -- list the callers of
-		// Actor::DispelWornItemEnchantments -- and InstallCallHook checks that
-		// each call really leads there before patching.
+		//   1.3.5 carried it as SE 24234+0xE3 / AE 24738+0xC2; the helper was
+		//   renumbered at 1.6.629 (418622), so on AE it is found without its id,
+		//   see FindRebuildDispelSite.
 		using DispelWornItemEnchantments_t = void (*)(RE::Actor*);
 		DispelWornItemEnchantments_t DispelWornItemEnchantments_orig{ nullptr };
 
@@ -495,27 +549,54 @@ namespace EEF
 			ScheduleActorCheck(a_actor);
 		}
 
+		// The rebuild helper's site, without its id. The helper was renumbered
+		// at 1.6.629 (24738 became 418622), and asking the library for an id it
+		// lacks is fatal, so on AE the site is found the other way round: every
+		// call to the dispel in the code segment, minus the transfer routine's
+		// and the dispel-and-recast routine's (the only callers that are not the
+		// helper on 1.6.1170), must leave exactly one. SE keeps 1.3.5's id.
+		[[nodiscard]] std::uintptr_t FindRebuildDispelSite(std::uintptr_t a_callee, std::uintptr_t a_transferSite)
+		{
+			if (REL::Module::IsSE()) {
+				static REL::Relocation<std::uintptr_t> rebuild{ REL::ID(24234) };
+				return FindCallSite("DispelWornItemEnchantments (model rebuild)", rebuild.address(), a_callee);
+			}
+
+			// Actor's dispel-and-recast routine, five bool arguments, the last
+			// gating the dispel; not CommonLib's CastPermanentMagic (38753), which
+			// is its neighbour. It re-applies for itself, so its call must stay.
+			static REL::Relocation<std::uintptr_t> recast{ REL::ID(38754) };
+			const auto recastBegin = recast.address();
+			const auto recastEnd = EndOfFunction(recastBegin);
+
+			const auto text = REL::Module::get().segment(REL::Segment::textx);
+			auto sites = CallsTo(text.address(), text.address() + text.size(), a_callee);
+			std::erase_if(sites, [&](std::uintptr_t a_site) {
+				return a_site == a_transferSite || (a_site >= recastBegin && a_site < recastEnd);
+			});
+			if (sites.size() != 1) {
+				SKSE::log::error("DispelWornItemEnchantments (model rebuild): {} other caller(s) of the dispel in the code segment, expected 1; not hooking", sites.size());
+				return 0;
+			}
+			SKSE::log::info("DispelWornItemEnchantments (model rebuild): call site found at {:X}", sites[0]);
+			return sites[0];
+		}
+
 		// One original pointer serves both sites: write_call returns the call's
 		// former target, which is the same function at each.
 		[[nodiscard]] bool InstallDispelRedirect()
 		{
 			static REL::Relocation<std::uintptr_t> callee{ REL::RelocationID(33828, 34620) };
-
 			static REL::Relocation<std::uintptr_t> transfer{ REL::RelocationID(50212, 51141) };
-			const auto transferSite = transfer.address() + (REL::Module::IsAE() ? 0x57D : 0x47B);
-			if (!InstallCallHook("DispelWornItemEnchantments (container transfer)", transferSite, callee.address(), &DispelWornItemEnchantments_Hook, DispelWornItemEnchantments_orig)) {
+
+			const auto transferSite = FindCallSite("DispelWornItemEnchantments (container transfer)", transfer.address(), callee.address());
+			if (!transferSite || !InstallCallHook("DispelWornItemEnchantments (container transfer)", transferSite, callee.address(), &DispelWornItemEnchantments_Hook, DispelWornItemEnchantments_orig)) {
 				return false;
 			}
 
-			std::uintptr_t rebuildSite = 0;
-			if (REL::Module::IsSE()) {
-				static REL::Relocation<std::uintptr_t> rebuild{ REL::ID(24234) };
-				rebuildSite = rebuild.address() + 0xE3;
-			} else if (REL::Module::IsAE() && REL::Module::get().version() >= REL::Version(1, 6, 629, 0)) {
-				static REL::Relocation<std::uintptr_t> rebuild{ REL::ID(418622) };
-				rebuildSite = rebuild.address() + 0xDB;
-			} else {
-				SKSE::log::warn("DispelWornItemEnchantments (model rebuild): no known site on this runtime; an armour trade will still drop the other worn enchantments until the menu closes");
+			const auto rebuildSite = FindRebuildDispelSite(callee.address(), transferSite);
+			if (!rebuildSite) {
+				SKSE::log::warn("DispelWornItemEnchantments (model rebuild): not hooked; an armour trade will still drop the other worn enchantments until the menu closes");
 				return true;
 			}
 			DispelWornItemEnchantments_t rebuildOrig{ nullptr };
