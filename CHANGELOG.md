@@ -3,6 +3,22 @@
 All notable changes to the NG port. 1.3.7 - 1.3.21 have been released;
 1.3.19 was an internal build that was folded into 1.3.20.
 
+## Unreleased
+
+**Fixed: trading with a follower stripped the enchantments off their worn
+armour.** Giving or taking any item in the trade menu, even a potion, removed
+every enchantment on the armour they were wearing. They came back only after a
+reload, or after closing the menu if armour had changed hands. Worn enchantments
+now stay put through a trade, and the follower's stats are right while the menu
+is still open.
+
+- Works on any game version the Address Library covers: the plugin locates the
+  engine calls it patches at launch instead of carrying per-version offsets, and
+  leaves the engine alone if it cannot find them.
+- Removed the "re-check after an effect is removed" path from 1.3.9; it never
+  triggered for worn enchantments.
+- New `LogLevel` ini setting: `info` by default, `debug` for troubleshooting.
+
 ## 1.3.21
 
 **The engine's duplicate apply is now blocked before it happens** - the same

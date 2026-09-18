@@ -41,20 +41,17 @@ OnEquip=true
 OnActorLoad=true
 RedirectDispelWornItemEnchantsVisitor=true
 RecalcPlayerInventoryWeightOnLoad=false
+; info by default; debug logs every step of the redirect and the re-check
+LogLevel=info
 ```
 
 ## Notes
 
-The original plugin installed raw code hooks to stop a duplicate enchantment apply
-- and a bad dispel - before either happened. This port does the same: it hooks the
-engine's call to `Actor::UpdateArmorAbility` and skips it when the actor already
-carries that item's enchantment, and it re-checks an actor whose effect was removed
-so anything wrongly dispelled is restored. `RedirectDispelWornItemEnchantsVisitor`
-controls both and defaults to true, matching the original.
+The original plugin (1.3.5) installed raw code hooks to stop a duplicate enchantment apply - and a bad dispel - before either happened. This port does the same, at the same three call sites: the engine's call to `Actor::UpdateArmorAbility` is skipped when the actor already carries that item's enchantment, and the two calls to `Actor::DispelWornItemEnchantments` on the trade path (the container transfer and the model rebuild it triggers) go to a replacement that dispels only effects whose source item is no longer worn. Nothing worn is ever dispelled, so nothing has to be re-applied and the numbers are right while the menu is still open. `RedirectDispelWornItemEnchantsVisitor` controls all three and defaults to true.
 
-The ability check itself is the exact test the original used: walk the actor's
-active effects and match the `(source, spell)` pair, where `source` is the item and
-`spell` is its enchantment.
+The call sites are found at launch, not carried as offsets: given the caller's and the callee's Address Library ids, the site is the one `call` inside the caller that lands on the callee. A caller with no such call, or two, is refused and logged.
+
+The ability check itself is the exact test the original used: walk the actor's active effects and match the `(source, spell)` pair, where `source` is the item and `spell` is its enchantment.
 
 ## Credits
 

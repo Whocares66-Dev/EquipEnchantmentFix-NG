@@ -2,12 +2,15 @@
 
 #include <SimpleIni.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <mutex>
 #include <unordered_set>
 #include <vector>
 
+#include "REL/Offset2ID.h"
 #include "REL/Relocation.h"
 #include "SKSE/Trampoline.h"
 
@@ -146,10 +149,17 @@ namespace EEF
 			}
 
 			for (auto& effect : *list) {
-				if (effect && effect->source == a_query->source && effect->spell == a_query->spell) {
-					a_query->found = true;
-					return true;
+				if (!effect || effect->source != a_query->source || effect->spell != a_query->spell) {
+					continue;
 				}
+				// Flagged means finished at the actor's next update, which a paused
+				// menu holds off. The engine's re-equip unequips first and re-applies
+				// over the flagged copy, so counting it would block that re-apply.
+				if (effect->flags.any(RE::ActiveEffect::Flag::kDispelled)) {
+					continue;
+				}
+				a_query->found = true;
+				return true;
 			}
 			return false;
 		}
@@ -226,19 +236,17 @@ namespace EEF
 		using UpdateArmorAbility_t = void (*)(RE::Actor*, RE::TESForm*, RE::ExtraDataList*);
 		UpdateArmorAbility_t UpdateArmorAbility_orig{ nullptr };
 
-		// The instance enchantment, or the form's own -- the engine falls back to
-		// the latter when the item carries no instance data.
+		// The engine's order (its own picker, 1.6.1170): an item carrying both
+		// gets the record's, so matching the instance's would never find the
+		// applied effect.
 		[[nodiscard]] RE::EnchantmentItem* GetApplicableEnchantment(RE::TESForm* a_form, RE::ExtraDataList* a_extraData)
 		{
-			if (auto* instance = GetWornEnchantment(a_extraData)) {
-				return instance;
-			}
 			if (a_form) {
-				if (auto* enchantable = a_form->As<RE::TESEnchantableForm>()) {
+				if (auto* enchantable = a_form->As<RE::TESEnchantableForm>(); enchantable && enchantable->formEnchanting) {
 					return enchantable->formEnchanting;
 				}
 			}
-			return nullptr;
+			return GetWornEnchantment(a_extraData);
 		}
 
 		void UpdateArmorAbility_Hook(RE::Actor* a_actor, RE::TESForm* a_form, RE::ExtraDataList* a_extraData)
@@ -262,51 +270,263 @@ namespace EEF
 		// function stays untouched and callable. Patching the function entry
 		// instead corrupts it -- the trampoline does not preserve the prologue, and
 		// the "original" it hands back is computed from the prologue bytes.
-		[[nodiscard]] std::uintptr_t UpdateArmorAbilityCallSite()
+		template <class Fn>
+		[[nodiscard]] bool InstallCallHook(const char* a_what, std::uintptr_t a_callSite, Fn a_hook, Fn& a_orig)
 		{
-			static REL::Relocation<std::uintptr_t> caller{ REL::RelocationID(36976, 38001) };
-			if (!caller.address()) {
-				return 0;
-			}
-			return caller.address() + (REL::Module::IsAE() ? 0x36D : 0x3BB);
-		}
-
-		[[nodiscard]] bool InstallUpdateArmorAbilityHook()
-		{
-			const auto callSite = UpdateArmorAbilityCallSite();
-			if (!callSite) {
-				SKSE::log::error("UpdateArmorAbility call site could not be resolved");
-				return false;
-			}
-
-			// Only patch it when it really is the call we expect. A different
-			// opcode means these offsets do not describe this runtime, and refusing
-			// to patch is the difference between a fallback and a corrupted engine.
-			const auto opcode = *reinterpret_cast<const std::uint8_t*>(callSite);
-			if (opcode != 0xE8 && opcode != 0xE9) {
-				SKSE::log::error(
-					"UpdateArmorAbility call site has opcode {:02X}, not a call; not hooking",
-					opcode);
+			if (!a_callSite) {
+				SKSE::log::error("{} call site could not be resolved", a_what);
 				return false;
 			}
 
 			try {
-				UpdateArmorAbility_orig = reinterpret_cast<UpdateArmorAbility_t>(
-					SKSE::GetTrampoline().write_call<5>(callSite, UpdateArmorAbility_Hook));
+				a_orig = reinterpret_cast<Fn>(SKSE::GetTrampoline().write_call<5>(a_callSite, a_hook));
 			} catch (const std::exception& e) {
-				SKSE::log::error("UpdateArmorAbility hook failed: {}", e.what());
+				SKSE::log::error("{} hook failed: {}", a_what, e.what());
 				return false;
 			} catch (...) {
-				SKSE::log::error("UpdateArmorAbility hook failed (unknown exception)");
+				SKSE::log::error("{} hook failed (unknown exception)", a_what);
 				return false;
 			}
 
-			if (!UpdateArmorAbility_orig) {
-				SKSE::log::error("UpdateArmorAbility hook produced a null original pointer");
+			if (!a_orig) {
+				SKSE::log::error("{} hook produced a null original pointer", a_what);
 				return false;
 			}
 
-			SKSE::log::info("UpdateArmorAbility hook installed at {:X}", callSite);
+			SKSE::log::info("{} hook installed at {:X}", a_what, a_callSite);
+			return true;
+		}
+
+		// --- finding the call sites at launch ----------------------------------
+		// A call site is a function start plus an offset into its body. The
+		// Address Library keeps the start stable across versions; nothing keeps
+		// the offset. Given the callee's id as well, the offset is derivable: the
+		// one call inside the caller that lands on the callee. So it is derived
+		// at launch, and verified on the machine it runs on, instead of carried
+		// per version.
+		[[nodiscard]] std::uintptr_t EndOfFunction(std::uintptr_t a_start)
+		{
+			// Sorted by offset; built once.
+			static const REL::Offset2ID table;
+			const auto base = REL::Module::get().base();
+			const auto offset = a_start - base;
+			const auto next = std::upper_bound(table.begin(), table.end(), offset, [](std::uint64_t a_lhs, const REL::IDDB::mapping_t& a_rhs) {
+				return a_lhs < a_rhs.offset;
+			});
+			return next != table.end() ? base + next->offset : a_start + 0x1000;
+		}
+
+		[[nodiscard]] std::vector<std::uintptr_t> CallsTo(std::uintptr_t a_begin, std::uintptr_t a_end, std::uintptr_t a_callee)
+		{
+			std::vector<std::uintptr_t> sites;
+			const auto* bytes = reinterpret_cast<const std::uint8_t*>(a_begin);
+			for (std::size_t i = 0; i + 5 <= a_end - a_begin; ++i) {
+				if (bytes[i] != 0xE8) {
+					continue;
+				}
+				std::int32_t rel = 0;
+				std::memcpy(&rel, bytes + i + 1, sizeof(rel));
+				if (a_begin + i + 5 + static_cast<std::uintptr_t>(static_cast<std::intptr_t>(rel)) == a_callee) {
+					sites.push_back(a_begin + i);
+				}
+			}
+			return sites;
+		}
+
+		[[nodiscard]] std::uintptr_t FindCallSite(const char* a_what, std::uintptr_t a_caller, std::uintptr_t a_callee)
+		{
+			const auto end = EndOfFunction(a_caller);
+			const auto sites = CallsTo(a_caller, end, a_callee);
+			if (sites.size() != 1) {
+				SKSE::log::error("{}: {} call(s) to the callee inside the caller at {:X} (extent {:#x}); not hooking",
+					a_what, sites.size(), a_caller, end - a_caller);
+				return 0;
+			}
+			SKSE::log::info("{}: call site found at {:X} (caller +{:#x})", a_what, sites[0], sites[0] - a_caller);
+			return sites[0];
+		}
+
+		[[nodiscard]] bool InstallUpdateArmorAbilityHook()
+		{
+			static REL::Relocation<std::uintptr_t> caller{ REL::RelocationID(36976, 38001) };
+			static REL::Relocation<std::uintptr_t> callee{ REL::RelocationID(37802, 38751) };
+			const auto site = FindCallSite("UpdateArmorAbility", caller.address(), callee.address());
+			return site && InstallCallHook("UpdateArmorAbility", site, &UpdateArmorAbility_Hook, UpdateArmorAbility_orig);
+		}
+
+		// --- the dispel redirect ----------------------------------------------
+		// The transfer routine dispels every worn enchantment on the NPC and then
+		// asks for a model update, which is what re-applies them and which only
+		// rebuilds when an equipment change flagged it. A potion flags nothing.
+		// No listener can react either: the engine raises the apply/remove event
+		// only for effects with a unique id, which it assigns only to (by all
+		// appearances) scripted effects. So what is still worn must not be
+		// dispelled in the first place, at both sites 1.3.5 redirected: the
+		// transfer routine's own call, and the rebuild helper's that its model
+		// update reaches when equipment did change (traced on 1.6.1170). The
+		// UpdateArmorAbility block above is the other half: the armour trade
+		// still re-equips, and would stack a copy of what was kept.
+		using DispelWornItemEnchantments_t = void (*)(RE::Actor*);
+		DispelWornItemEnchantments_t DispelWornItemEnchantments_orig{ nullptr };
+
+		// An active effect names its source as the base object only, so (item,
+		// enchantment) is the finest identity there is; on the item alone, any
+		// worn copy would keep an effect it did not produce.
+		struct WornEnchantment
+		{
+			RE::TESBoundObject* source;
+			RE::MagicItem*      spell;
+		};
+
+		struct StaleQuery
+		{
+			const std::vector<WornEnchantment>* worn;
+			std::vector<RE::ActiveEffect*>*     stale;
+		};
+
+		// Weapons are left alone as the engine's visitor leaves them; the unequip
+		// path handles those. Split out so the walk can sit under __try, which
+		// MSVC refuses beside objects with destructors.
+		void CollectStaleEffects(RE::MagicTarget* a_target, StaleQuery* a_query)
+		{
+			auto* list = a_target->GetActiveEffectList();
+			if (!list) {
+				return;
+			}
+			for (auto* effect : *list) {
+				if (!effect || !effect->source || !effect->spell) {
+					continue;
+				}
+				if (effect->flags.any(RE::ActiveEffect::Flag::kDispelled)) {
+					continue;
+				}
+				if (!effect->source->As<RE::TESObjectARMO>()) {
+					continue;
+				}
+				const auto stillWorn = std::any_of(a_query->worn->begin(), a_query->worn->end(), [&](const WornEnchantment& w) {
+					return w.source == effect->source && w.spell == effect->spell;
+				});
+				if (!stillWorn) {
+					a_query->stale->push_back(effect);
+				}
+			}
+		}
+
+		[[nodiscard]] bool TryCollectStaleEffects(RE::MagicTarget* a_target, StaleQuery* a_query)
+		{
+			__try {
+				CollectStaleEffects(a_target, a_query);
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		void DispelWornItemEnchantments_Hook(RE::Actor* a_actor)
+		{
+			if (!IsValidActor(a_actor)) {
+				DispelWornItemEnchantments_orig(a_actor);
+				return;
+			}
+
+			auto* changes = a_actor->GetInventoryChanges(true);
+			if (!changes || !changes->entryList) {
+				DispelWornItemEnchantments_orig(a_actor);
+				return;
+			}
+
+			// One base item can be in the bag several times, each instance with its
+			// own enchantment; only the worn instance's counts.
+			std::vector<WornEnchantment> worn;
+			for (auto* entry : *changes->entryList) {
+				if (!entry || !entry->object || !entry->object->As<RE::TESObjectARMO>() || !entry->extraLists) {
+					continue;
+				}
+				for (auto* xList : *entry->extraLists) {
+					if (!xList || !(xList->HasType<RE::ExtraWorn>() || xList->HasType<RE::ExtraWornLeft>())) {
+						continue;
+					}
+					if (auto* enchantment = GetApplicableEnchantment(entry->object, xList)) {
+						worn.push_back({ entry->object, enchantment });
+					}
+				}
+			}
+
+			auto* target = a_actor->AsMagicTarget();
+			if (!target) {
+				DispelWornItemEnchantments_orig(a_actor);
+				return;
+			}
+
+			std::vector<RE::ActiveEffect*> stale;
+			StaleQuery                     query{ &worn, &stale };
+			if (!TryCollectStaleEffects(target, &query)) {
+				// The engine's own dispel is the known-safe fallback.
+				SKSE::log::error("active-effect walk faulted in the dispel redirect (actor {:08X}); engine dispel used", a_actor->GetFormID());
+				DispelWornItemEnchantments_orig(a_actor);
+				return;
+			}
+
+			for (auto* effect : stale) {
+				effect->Dispel(false);
+			}
+
+			SKSE::log::debug("dispel redirect: actor {:08X}, {} worn armour kept, {} stale effect(s) dispelled",
+				a_actor->GetFormID(), worn.size(), stale.size());
+		}
+
+		// The helper was renumbered at 1.6.629 (24738 became 418622) and an
+		// absent-id lookup is fatal, so on AE it is found by elimination: the
+		// callers of the dispel that are neither the transfer routine nor the
+		// dispel-and-recast routine, exactly one on 1.6.1170. SE keeps 1.3.5's id.
+		[[nodiscard]] std::uintptr_t FindRebuildDispelSite(std::uintptr_t a_callee, std::uintptr_t a_transferSite)
+		{
+			if (REL::Module::IsSE()) {
+				static REL::Relocation<std::uintptr_t> rebuild{ REL::ID(24234) };
+				return FindCallSite("DispelWornItemEnchantments (model rebuild)", rebuild.address(), a_callee);
+			}
+
+			// Never called; located only so its own call to the dispel can be
+			// excluded from the search. It re-applies for itself, so that call
+			// must keep dispelling. The five-argument dispel-and-recast routine,
+			// not CommonLib's CastPermanentMagic (38753, its neighbour).
+			static REL::Relocation<std::uintptr_t> recast{ REL::ID(38754) };
+			const auto recastBegin = recast.address();
+			const auto recastEnd = EndOfFunction(recastBegin);
+
+			const auto text = REL::Module::get().segment(REL::Segment::textx);
+			auto sites = CallsTo(text.address(), text.address() + text.size(), a_callee);
+			std::erase_if(sites, [&](std::uintptr_t a_site) {
+				return a_site == a_transferSite || (a_site >= recastBegin && a_site < recastEnd);
+			});
+			if (sites.size() != 1) {
+				SKSE::log::error("DispelWornItemEnchantments (model rebuild): {} other caller(s) of the dispel in the code segment, expected 1; not hooking", sites.size());
+				return 0;
+			}
+			SKSE::log::info("DispelWornItemEnchantments (model rebuild): call site found at {:X}", sites[0]);
+			return sites[0];
+		}
+
+		// The same callee at both sites, so one original serves.
+		[[nodiscard]] bool InstallDispelRedirect()
+		{
+			static REL::Relocation<std::uintptr_t> callee{ REL::RelocationID(33828, 34620) };
+			static REL::Relocation<std::uintptr_t> transfer{ REL::RelocationID(50212, 51141) };
+
+			const auto transferSite = FindCallSite("DispelWornItemEnchantments (container transfer)", transfer.address(), callee.address());
+			if (!transferSite || !InstallCallHook("DispelWornItemEnchantments (container transfer)", transferSite, &DispelWornItemEnchantments_Hook, DispelWornItemEnchantments_orig)) {
+				return false;
+			}
+
+			const auto rebuildSite = FindRebuildDispelSite(callee.address(), transferSite);
+			if (!rebuildSite) {
+				SKSE::log::warn("DispelWornItemEnchantments (model rebuild): not hooked; an armour trade will still drop the other worn enchantments until the menu closes");
+				return true;
+			}
+			DispelWornItemEnchantments_t rebuildOrig{ nullptr };
+			if (InstallCallHook("DispelWornItemEnchantments (model rebuild)", rebuildSite, &DispelWornItemEnchantments_Hook, rebuildOrig)) {
+				DispelWornItemEnchantments_orig = rebuildOrig;
+			}
 			return true;
 		}
 
@@ -338,6 +558,8 @@ namespace EEF
 			};
 			std::vector<Candidate> candidates;
 
+			SKSE::log::debug("re-check actor {:08X} filter {:08X}", a_actor->GetFormID(), a_onlyForm);
+
 			for (auto* entry : *changes->entryList) {
 				if (!entry || !entry->object) {
 					continue;
@@ -363,6 +585,10 @@ namespace EEF
 				}
 
 				auto* enchantment = GetWornEnchantment(worn);
+				SKSE::log::debug("  worn armour {:08X} wornList={} instanceEnch={:08X} casting={}",
+					entry->object->GetFormID(), worn != nullptr,
+					enchantment ? enchantment->GetFormID() : 0,
+					enchantment ? static_cast<int>(enchantment->data.castingType) : -1);
 				if (!enchantment) {
 					continue;
 				}
@@ -380,12 +606,16 @@ namespace EEF
 			}
 
 			for (auto& c : candidates) {
-				if (HasItemAbility(a_actor, c.form, c.enchantment)) {
+				const auto check = TryHasItemAbility(a_actor, c.form, c.enchantment);
+				SKSE::log::debug("  ability check {:08X}/{:08X} -> {}", c.form->GetFormID(),
+					c.enchantment->GetFormID(),
+					check == AbilityCheck::kPresent ? "present" : check == AbilityCheck::kMissing ? "missing" : "unknown");
+				if (check != AbilityCheck::kMissing) {
 					continue;
 				}
 
-				SKSE::log::debug(
-					"re-applying enchantment ability for {:08X} on actor {:08X}",
+				SKSE::log::info(
+					"  re-applying enchantment ability for {:08X} on actor {:08X}",
 					c.form->GetFormID(),
 					a_actor->GetFormID());
 
@@ -418,6 +648,8 @@ namespace EEF
 			if (!handle) {
 				return;
 			}
+
+			SKSE::log::debug("queued re-check for {:08X}", actor->GetFormID());
 
 			{
 				std::scoped_lock lock(s_queueLock);
@@ -470,13 +702,11 @@ namespace EEF
 				const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 									std::chrono::steady_clock::now() - started)
 									.count();
-				if (ms >= 25 || batch.size() >= 32) {
-					SKSE::log::info(
-						"drain: {} queued, {} processed, {} ms",
-						batch.size(),
-						processed,
-						ms);
-				}
+				SKSE::log::info(
+					"drain: {} queued, {} processed, {} ms",
+					batch.size(),
+					processed,
+					ms);
 			});
 		}
 
@@ -494,6 +724,12 @@ namespace EEF
 			s_onActorLoad = ini.GetBoolValue("EEF", "OnActorLoad", true);
 			s_recalcWeightOnLoad = ini.GetBoolValue("EEF", "RecalcPlayerInventoryWeightOnLoad", false);
 			s_redirectDispel = ini.GetBoolValue("EEF", "RedirectDispelWornItemEnchantsVisitor", true);
+
+			// "debug" shows every step of the redirect and the re-check.
+			if (const auto* level = ini.GetValue("EEF", "LogLevel", nullptr)) {
+				spdlog::set_level(spdlog::level::from_str(level));
+				spdlog::flush_on(spdlog::level::from_str(level));
+			}
 
 			SKSE::log::info(
 				"settings: OnEquip={} OnActorLoad={} RecalcWeight={} RedirectDispel={}",
@@ -581,22 +817,6 @@ namespace EEF
 		return RE::BSEventNotifyControl::kContinue;
 	}
 
-	RE::BSEventNotifyControl ActiveEffectEventHandler::ProcessEvent(
-		const RE::TESActiveEffectApplyRemoveEvent*               a_event,
-		RE::BSTEventSource<RE::TESActiveEffectApplyRemoveEvent>*)
-	{
-		// isApplied == false means an active effect was removed. If it belonged to a
-		// worn item's enchantment, the engine may have dispelled it wrongly; queue a
-		// re-check and ProcessActor will re-apply the missing ability.
-		if (s_redirectDispel && a_event && !a_event->isApplied) {
-			if (a_event->target) {
-				ScheduleActorCheck(a_event->target.get());
-			}
-		}
-
-		return RE::BSEventNotifyControl::kContinue;
-	}
-
 	EquipEventHandler* EquipEventHandler::GetSingleton()
 	{
 		static EquipEventHandler singleton;
@@ -606,12 +826,6 @@ namespace EEF
 	LoadEventHandler* LoadEventHandler::GetSingleton()
 	{
 		static LoadEventHandler singleton;
-		return &singleton;
-	}
-
-	ActiveEffectEventHandler* ActiveEffectEventHandler::GetSingleton()
-	{
-		static ActiveEffectEventHandler singleton;
 		return &singleton;
 	}
 
@@ -633,14 +847,14 @@ namespace EEF
 			holder->AddEventSink<RE::TESInitScriptEvent>(LoadEventHandler::GetSingleton());
 		}
 		if (s_redirectDispel) {
-			// Blocking is the stronger half: stop the engine from applying an
-			// enchantment the actor already carries. The post-hoc recheck stays as
-			// the fallback (and as the repair for an enchantment the engine wrongly
-			// dispels), so the option keeps working even if the hook is unavailable.
-			if (!InstallUpdateArmorAbilityHook()) {
-				SKSE::log::warn("UpdateArmorAbility hook unavailable; using the post-hoc recheck only");
+			// Without the block, the armour trade's re-equip would stack a copy of
+			// what the redirect kept, so the redirect only goes in after it.
+			const bool blocked = InstallUpdateArmorAbilityHook();
+			if (!blocked) {
+				SKSE::log::warn("UpdateArmorAbility hook unavailable; the dispel redirect is not installed either, and worn enchantments will drop on an inventory change");
+			} else if (!InstallDispelRedirect()) {
+				SKSE::log::warn("dispel redirect unavailable; worn enchantments will still drop on an inventory change");
 			}
-			holder->AddEventSink<RE::TESActiveEffectApplyRemoveEvent>(ActiveEffectEventHandler::GetSingleton());
 		}
 
 		SKSE::log::info(
