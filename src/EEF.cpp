@@ -362,7 +362,7 @@ namespace EEF
 		// it. An active effect records its source as the base object only, so
 		// this pair is the finest identity there is; matching on the item alone
 		// would keep an effect as long as any copy of that item is worn, which is
-		// wrong when two copies carry different enchantments and only one is on.
+		// wrong when the worn copy is not the one the effect came from.
 		struct WornEnchantment
 		{
 			RE::TESBoundObject* source;
@@ -424,8 +424,10 @@ namespace EEF
 			}
 
 			// Every worn armour instance with the enchantment the engine applied
-			// for it. A stack of one base item can have more than one worn
-			// instance (two rings), each with its own extra list.
+			// for it. One base item can be in the bag several times, each instance
+			// with its own extra list and its own enchantment (a gold ring of
+			// fortify health worn, one of fortify stamina carried); the worn one is
+			// found by its ExtraWorn, and only its enchantment is a pair.
 			std::vector<WornEnchantment> worn;
 			for (auto* entry : *changes->entryList) {
 				if (!entry || !entry->object || !entry->object->As<RE::TESObjectARMO>() || !entry->extraLists) {
